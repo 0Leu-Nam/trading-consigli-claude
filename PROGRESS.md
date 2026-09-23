@@ -19,6 +19,8 @@
   - `.env.example` (aggiunto `STOOQ_API_KEY`)
 
 ## Problemi riscontrati e decisioni prese
+- **Divergenza main locale/remota (2026-09-24)**: dopo la Fase 3 il push è stato rifiutato ("fetch first") perché il bot di Actions aveva già auto-committato `data/app.db` sul remote. Risolto con `git pull --rebase origin main` e, sul solo conflitto `data/app.db` (binario), `git checkout --theirs` per tenere il DB CANONICO del bot (l'archetto di crescita CI); le 12.500 righe prezzo verranno reinserite dal prossimo run di `price_screener` (INSERT OR IGNORE, idempotente). Push → `5b7d099..37d1e56`.
+- **Rumore line endings su Windows**: warning "LF will be replaced by CRLF" a ogni `git add` → aggiunto `.gitattributes` (`* text=auto`, `.db`/`-wal`/`-shm` come `binary`) per normalizzare e silenziare. Nessun cambio di comportamento.
 - **Azioni di classe su Yahoo**: Yahoo vuole il trattino (`BRK-B`) e rifiuta il punto (`BRK.B`); yfinance inoltre scarta dai risultati i simboli che non risolve → nel batch serviva passare a `download` l'alias `ticker.replace(".", "-")` e ri-mappare i nomi originali in output. Risolto con `_yahoo_alias()` + `_extract_ticker()` resiliente (ticker assente = lista vuota, non eccezione KeyError).
 - **Wikipedia 403 con l'UA di pandas** → scaricata la pagina con `requests` + User-Agent browser e poi `pandas.read_html`; `data/sp500.txt` è un file versionato, la rigenerazione non è un'operazione di runtime.
 - **Stooq: senza chiave risponde con challenge JavaScript** ("This site requires JavaScript...") da richieste non-browser → Stooq è usabile SOLO con `STOOQ_API_KEY` gratuita (CAPTCHA) come fallback per i ticker vuoti di yfinance; la risposta di quota si riconosceva dal testo "Exceeded the daily hits limit".
