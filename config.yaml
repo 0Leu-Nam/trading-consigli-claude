@@ -16,11 +16,12 @@ modules:
     open_market_only: false
     max_filings: 250        # cap per run (1 hit EFTS = 1 filing); alza per più copertura
   price_screener:
-    enabled: false          # FASE 3 — anomalie prezzo/volume
-    lookback_days: 5
-    vol_spike_mult: 3.0
-    max_symbols: 500
-    universe: sp500          # oppure inline list: ["AAPL", ...]
+    enabled: true           # FASE 3 — anomalie prezzo/volume
+    period_days: 30         # finestra OHLCV da scaricare (serve lookback per le medie)
+    history_days: 25        # barre salvate in price_snapshots per ticker (~500×25 righe steady-state)
+    vol_spike_mult: 3.0     # soglia spike usata dalla fase di scoring (Fase 6)
+    max_symbols: 500        # cap per run
+    universe: file:data/sp500.txt   # o inline list: ["AAPL", ...]
   news_sentiment:
     enabled: false          # FASE 4 — notizie + sentiment
     sources: [marketaux, finviz_rss]
