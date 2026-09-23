@@ -1,0 +1,21 @@
+# dipendenze Python (non versionate)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# segreti e configurazione locale
+.env
+
+# artefatti runtime
+dist/
+build/
+
+# file transitori di SQLite (WAL/journal): mai committare
+data/*-wal
+data/*-shm
+
+# dati bulk non versionabili (i feed grezzi vanno qui, non nel DB versionato)
+data/raw/

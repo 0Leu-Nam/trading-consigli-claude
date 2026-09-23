@@ -1,0 +1,68 @@
+# Pipeline H24 senza server: raccolta dati + analisi + auto-commit.
+#
+# - schedule: 2 volte/giorno (13:00 e 21:00 UTC). Il cron è valutato da GitHub
+#   stesso, quindi NON dipende da un server sempre acceso né va in "sleep"
+#   per inattività dell'utente.
+# - Il job `run` committa su questo repo il DB aggiornato (data/app.db) e
+#   l'eventuale report: il repo resta quindi "attivo" e il cron non rischia la
+#   disattivazione per inattività.
+# - L'auto-commit usa il GITHUB_TOKEN dedicato (scope contents) → nessun PAT.
+#   I commit fatti col GITHUB_TOKEN NON ri-attivano questo stesso workflow
+#   (GitHub li ignora come trigger), quindi non c'è rischio di loop.
+# - `workflow_dispatch` permette l'esecuzione manuale dal tab Actions.
+
+name: pipeline
+
+on:
+  schedule:
+    - cron: "0 13,21 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Installa dipendenze
+        run: pip install -e ".[dev]"
+      - name: Esegue i test
+        run: python -m pytest
+
+  run:
+    name: Raccogli e analizza
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Installa dipendenze
+        run: pip install -e ".[dev]"
+      - name: Esegue la pipeline (moduli attivi)
+        env:
+          SEC_EDGAR_USER_AGENT: ${{ secrets.SEC_EDGAR_USER_AGENT }}
+        run: python -m core.cli run-all
+      - name: Committa i dati aggiornati (se cambiati)
+        run: |
+          git config user.name "trading-consigli-bot"
+          git config user.email "trading-consigli-bot@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "Nessuna modifica ai dati: salto il commit."
+          else
+            git commit -m "data: aggiornamento pipeline $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi

@@ -1,0 +1,36 @@
+# Configurazione centrale dell'app.
+# Ogni modulo si attiva/disattiva col flag `enabled`. L'orchestratore carica
+# solo i moduli con enabled: true. Nessuna chiave API qui: solo nel file .env.
+
+database:
+  path: data/app.db
+
+run:
+  default_lookback_days: 7
+
+modules:
+  insider_trading:
+    enabled: true           # FASE 1 — SEC EDGAR Form 4
+    lookback_days: 7
+    min_value_usd: 50000
+    open_market_only: false
+    max_filings: 250        # cap per run (1 hit EFTS = 1 filing); alza per più copertura
+  price_screener:
+    enabled: false          # FASE 3 — anomalie prezzo/volume
+    lookback_days: 5
+    vol_spike_mult: 3.0
+    max_symbols: 500
+    universe: sp500          # oppure inline list: ["AAPL", ...]
+  news_sentiment:
+    enabled: false          # FASE 4 — notizie + sentiment
+    sources: [marketaux, finviz_rss]
+    sentiment_gte: 0.35
+  institutional_holdings:
+    enabled: false          # FASE 5 — 13F (trimestrale)
+
+notifications:
+  telegram:
+    enabled: false          # FASE 8
+
+dashboard:
+  format: html_static       # GitHub Pages
