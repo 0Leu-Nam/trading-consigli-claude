@@ -1,0 +1,7 @@
+# Normalizzazione line endings: testo con LF in repo, checkout secondo piattaforma.
+* text=auto
+
+# I file SQLite sono binari: niente conversione di line endings.
+data/*.db binary
+data/*.db-wal binary
+data/*.db-shm binary
