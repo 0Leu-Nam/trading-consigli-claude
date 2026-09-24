@@ -23,9 +23,12 @@ modules:
     max_symbols: 500        # cap per run
     universe: file:data/sp500.txt   # o inline list: ["AAPL", ...]
   news_sentiment:
-    enabled: false          # FASE 4 — notizie + sentiment
-    sources: [marketaux, finviz_rss]
-    sentiment_gte: 0.35
+    enabled: false          # FASE 4 — notizie + sentiment (attivazione DOPO chiusura Fase 2/3 = 100%)
+    sources: [marketaux, yahoo_finance_rss]
+    sentiment_gte: 0.35     # soglia label positive/negative (score in [-1,1])
+    max_symbols: 40         # cap ticker per run (priorità: insider recente, poi watchlist, poi universe)
+    lookback_insider_days: 7
+    universe: file:data/sp500.txt
   institutional_holdings:
     enabled: false          # FASE 5 — 13F (trimestrale)
 

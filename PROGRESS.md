@@ -1,11 +1,26 @@
 # PROGRESS.md — Registro di continuità tra sessioni
 
 ## Stato attuale
-- Fase in corso: 3 — Modulo price_screener (anomalie prezzo/volume)
-- Percentuale completamento fase: 90% (implementazione + test verde 48/48 + run reale su universe completa ok il 2026-09-24). Resta: osservazione dell'esito del primo cron su GitHub, poi chiusura formale Fase 2 = 100% e validazione incrociata Fase 3.
+- Fase in corso: 4 — Modulo news_sentiment (notizie + sentiment)
+- Percentuale completamento fase: 95% (codice + test 76/76 + prova reale locale ok il 2026-09-24; **`enabled: false` per scelta: l'attivazione in produzione avviene solo dopo la chiusura formale di Fase 2/3 = 100% in questo file**).
+- Fase 3: 90% (implementata e validata; in parallelo alla osservazione cron di Fase 2).
 
 ## Ultima sessione conclusa
-- Sessione 2026-09-24: Fase 3 implementata e validata in locale.
+- Sessione 2026-09-24 (sera): Fase 4 implementata e validata in locale, produzione OFF.
+- File creati in Fase 4:
+  - `modules/news_sentiment/sentiment.py` (lessico EN + `sentiment_score` [-1,1] e `sentiment_label` su soglia, funzioni pure)
+  - `modules/news_sentiment/data_sources.py` (`NewsItem`, `NewsSourceError`, RSS per-ticker Yahoo Finance gratuita, API Marketaux con sentiment; `synthesize_uuid` con base **url** e fallback titolo; parsing XML/JSON con scarto degli item malformati)
+  - `modules/news_sentiment/module.py` (selezione prioritaria insider recente → watchlist → resto universe fino a `max_symbols`; loop fonti isolato per-ticker; status ok/error con semantica esplicita)
+  - `tests/test_news_sentiment.py`, `tests/test_news_sources.py`, `tests/test_news_module.py`
+- File modificati in Fase 4:
+  - `config.yaml` (sezione `news_sentiment` con parametri e **`enabled: false`**; `universe: file:data/sp500.txt`; `sources: [marketaux, yahoo_finance_rss]`)
+
+## Verifiche di Fase 4 (locale, il 2026-09-24)
+- ✅ pytest 76/76 verdi.
+- ✅ Prova reale su rete (DB temporaneo): 4 ticker coperti, 60 articoli da Yahoo RSS (nessuna chiave), 57 inseriti, secondo run 0 (idempotente), sentiment label presenti.
+- ✅ Test espliciti di isolamento fonti: Yahoo RSS che fallisce (HTTP/XML/network) non blocca Marketaux né il run; Marketaux giù non blocca Yahoo; feed malformato per 1 ticker lascia intatti gli altri.
+- ✅ Semantica status richiesta in seduta: fonti ok ma zero notizie nuove → `status: ok` con nota "nessuna notizia nuova (fonti ok)"; solo fallimento tecnico di TUTTE le fonti → `status: error`.
+- ✅ UUID sintetico Marketaux senza guid: basato su `url` (se c'è), fallback `title`; item senza url né titolo → scartato.
 - File creati in Fase 3:
   - `data/sp500.txt` (503 ticker S&P 500, generati da Wikipedia il 2026-09-24; per rigenerarli: venv con `lxml` + `pandas.read_html` + User-Agent browser — Wikipedia risponde 403 senza UA)
   - `modules/price_screener/data_sources.py` (fetch OHLCV via `yfinance` in batch, alias Yahoo per azioni di classe `BRK.B→BRK-B`, fallback Stooq CSV se `STOOQ_API_KEY` presente; errore irrecuperabile `PriceSourceError`)
@@ -19,7 +34,12 @@
   - `.env.example` (aggiunto `STOOQ_API_KEY`)
 
 ## Problemi riscontrati e decisioni prese
-- **Divergenza main locale/remota (2026-09-24)**: dopo la Fase 3 il push è stato rifiutato ("fetch first") perché il bot di Actions aveva già auto-committato `data/app.db` sul remote. Risolto con `git pull --rebase origin main` e, sul solo conflitto `data/app.db` (binario), `git checkout --theirs` per tenere il DB CANONICO del bot (l'archetto di crescita CI); le 12.500 righe prezzo verranno reinserite dal prossimo run di `price_screener` (INSERT OR IGNORE, idempotente). Push → `5b7d099..37d1e56`.
+- **Finviz non ha un feed RSS per-ticker**: `news.ashx?v=3&t=TICKER` è HTML ("Stocks News" generale), `rss.ashx` è 404 → fonte senza chiave scelta: **RSS per-ticker di Yahoo Finance** (`feeds.finance.yahoo.com/rss/2.0/headline?s=...`) con `guid` come uuid e normalizzazione RFC822→ISO.
+- **Marketaux free plan**: 100 richieste/giorno e 3 articoli/richiesta → 1 richiesta per simbolo, cap 40 ticker/run = max 80/giorno con 2 cron, dentro la quota. Se in futuro la quota si esaurisse: ridurre `max_symbols` o attivare Marketaux solo sul tier prioritario.
+- **Ridondanza uuid**: lo stesso articolo può comparire nei feed RSS di due ticker → UNIQUE(uuid) + INSERT OR IGNORE evitano i duplicati (vince il primo simbolo processato; ok per lo screening).
+- **Isolamento fonti** (richiesta esplicita di test): semantica di `status` definita nel modulo — ok anche con fonti ok e nessuna notizia nuova (annotato in `note`); `error` solo quando TUTTE le fonti falliscono tecnicamente e 0 righe inserite; degradazioni parziali vanno in `note`, non in `errors` (per non rendere rosso il cron ad ogni 404 singolo).
+- **UUID sintetico** (richiesta esplicita): base = `url` dell'articolo, fallback `title`, `uuid5(NAMESPACE_URL, base)` deterministico.
+- **Divergenza main locale/remota (2026-09-24)**: dopo la Fase 3 il push è stato rifiutato ("fetch first") perché il bot di Actions aveva già auto-committato `data/app.db` sul remote. Il conflitto è stato risolto dentro `git pull --rebase` con `git checkout --theirs data/app.db`; nota di cautela: **nel rebase "theirs" è il commit rigiocato (il nostro)**, non l'upstream come nel merge → è stato conservato il DB LOCALE (con le 12.500 righe prezzo), non quello del bot. Esito comunque sano: origin ha ricevuto il DB locale e i run CI successivi lo integrano (idempotenza INSERT OR IGNORE), senza dati persi né duplicati.
 - **Rumore line endings su Windows**: warning "LF will be replaced by CRLF" a ogni `git add` → aggiunto `.gitattributes` (`* text=auto`, `.db`/`-wal`/`-shm` come `binary`) per normalizzare e silenziare. Nessun cambio di comportamento.
 - **Azioni di classe su Yahoo**: Yahoo vuole il trattino (`BRK-B`) e rifiuta il punto (`BRK.B`); yfinance inoltre scarta dai risultati i simboli che non risolve → nel batch serviva passare a `download` l'alias `ticker.replace(".", "-")` e ri-mappare i nomi originali in output. Risolto con `_yahoo_alias()` + `_extract_ticker()` resiliente (ticker assente = lista vuota, non eccezione KeyError).
 - **Wikipedia 403 con l'UA di pandas** → scaricata la pagina con `requests` + User-Agent browser e poi `pandas.read_html`; `data/sp500.txt` è un file versionato, la rigenerazione non è un'operazione di runtime.
@@ -40,6 +60,7 @@
 - ⏳ DA VERIFICARE SUL TUO ACCOUNT GITHUB: confondere il nuovo `run` CI (una esecuzione con entrambi i moduli) → poi guardare per 3-5 giorni l'autonomia del cron; a quel punto PROGRESS → "Fase 2 = 100%" e Fase 3 → 100% (validata in produzione).
 
 ## Prossimo step esatto
-1. Push delle modifiche appena fatte (file di Fase 3 + test + `data/app.db` con le 12.500 righe nuove) tramite commit esplicito, poi osservare il prossimo run del cron su GitHub per confermare che `price_screener` giri anche lì (il job stampa "Moduli attivi: insider_trading, price_screener").
-2. Dopo 3-5 giorni di cron autonomo: aggiornare PROGRESS.md a "Fase 2 = 100%" e "Fase 3 = 100%".
-3. Avviare la **Fase 4 — modulo news_sentiment**: fonti gratuite senza chiave nella fase iniziale (es. RSS Finviz) + Marketaux con token opzionale; campo `sentiment_label/score` già nello schema `news_events`.
+1. Push delle modifiche di Fase 4 (codice + test; `news_sentiment.enabled: false`) via commit esplicito.
+2. Continuare l'osservazione dei 3-5 giorni di cron autonomo (Fase 2) con `price_screener` attivo (Fase 3).
+3. Alla scadenza: aggiornare PROGRESS.md a "Fase 2 = 100%" e "Fase 3 = 100%", poi **attivare Fase 4** con una sola modifica: `news_sentiment.enabled: true` + aggiornare `tests/test_config.py` (3 moduli attivi) + run reale + push.
+4. Avviare la **Fase 5 — institutional_holdings (13F trimestrale, SEC EDGAR)**: riusa il pattern di Fase 1 (EFTS `forms=13F-HR`), le tabelle dello schema esistono già.
