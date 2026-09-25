@@ -1,6 +1,6 @@
 # Pipeline H24 senza server: raccolta dati + analisi + auto-commit.
 #
-# - schedule: 2 volte/giorno (13:00 e 21:00 UTC). Il cron è valutato da GitHub
+# - schedule: 2 volte/giorno (13:17 e 21:17 UTC). Il cron è valutato da GitHub
 #   stesso, quindi NON dipende da un server sempre acceso né va in "sleep"
 #   per inattività dell'utente.
 # - Il job `run` committa su questo repo il DB aggiornato (data/app.db) e
@@ -15,7 +15,7 @@ name: pipeline
 
 on:
   schedule:
-    - cron: "0 13,21 * * *"
+    - cron: "17 13,21 * * *"
   workflow_dispatch: {}
 
 permissions:

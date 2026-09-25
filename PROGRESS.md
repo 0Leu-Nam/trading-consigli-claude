@@ -49,6 +49,7 @@
 - PyYAML 1.1 parsa `on:` come booleano → falso errore di validazione locale; GitHub usa YAML 1.2, `on:` è corretto. Nessuna azione.
 - Auto-commit con GITHUB_TOKEN dedicato (`contents: write`): zero secret/carta; i commit bot non ri-innescano il workflow (nessun loop) e tengono il repo attivo (cron non disattivato a 60gg nei repo privati).
 - `concurrency` con `cancel-in-progress: false`: i 2 run/giorno non si sovrappongono (sicurezza WAL e auto-commit).
+- **Ritardi cron osservati (2026-09-25)**: due run consecutivi dello schedule hanno avuto ritardi rilevanti rispetto all'orario previsto — il run atteso alle 13:00 UTC è partito con ~4h44min di ritardo, quello atteso alle 21:00 UTC con ~2h45min. Ipotesi: congestione dei runner GitHub Actions nella fascia oraria "tonda" (:00) condivisa da migliaia di workflow. **Decisione**: schedule spostato a minuto non standard `17` (`17 13,21 * * *` → 13:17 e 21:17 UTC) per uscire dal picco. Verifica attesa: i prossimi run autopartiti dovrebbero iniziare entro pochi minuti dall'orario esatto; la voce verrà aggiornata (o rivista) in base all'esito. Nessun dispatch manuale di controllo: l'obiettivo è osservare proprio il comportamento del cron automatico.
 - Primo run CI lento (~6-9 min) per 250 filing × 2 richieste SEC: normale; se in futuro i run CI di SEC dovessero superare i 10-15 min (rate limit sugli IP GitHub), abbassare `max_filings`.
 
 ## Criteri di successo Fase 3 (locale, già verificati il 2026-09-24)
@@ -64,3 +65,5 @@
 2. Continuare l'osservazione dei 3-5 giorni di cron autonomo (Fase 2) con `price_screener` attivo (Fase 3).
 3. Alla scadenza: aggiornare PROGRESS.md a "Fase 2 = 100%" e "Fase 3 = 100%", poi **attivare Fase 4** con una sola modifica: `news_sentiment.enabled: true` + aggiornare `tests/test_config.py` (3 moduli attivi) + run reale + push.
 4. Avviare la **Fase 5 — institutional_holdings (13F trimestrale, SEC EDGAR)**: riusa il pattern di Fase 1 (EFTS `forms=13F-HR`), le tabelle dello schema esistono già.
+
+Nota per Fase 7 (da non dimenticare): dividere in 7a (dashboard tabellare pura) e 7b (aggiunta sezione discorsiva via template, non LLM, per non rompere la tabella già funzionante). Vedi conversazione Claude del 24/09 per dettaglio completo del prompt.
