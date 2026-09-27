@@ -7,6 +7,7 @@ database:
 
 run:
   default_lookback_days: 7
+  partial_error_threshold: 0   # errori parziali (es. singoli filing falliti) OLTRE questa soglia → run 'warning'; 0 = una qualsiasi anomalia
 
 modules:
   insider_trading:

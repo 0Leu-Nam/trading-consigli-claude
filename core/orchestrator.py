@@ -46,6 +46,22 @@ def run_module(key: str, conn, config: dict, env_getter) -> ModuleResult:
     return result
 
 
+def classify_run(results: list[ModuleResult], config: dict | None = None) -> str:
+    """Classifica l'esito complessivo di un run: 'ok' | 'warning' | 'error'.
+
+    - ``error``: almeno un modulo fallito del tutto (status "error");
+    - ``warning``: moduli ok/skipped ma con errori parziali (es. un singolo
+      filing irrecuperabile) sopra la soglia ``run.partial_error_threshold``;
+    - ``ok``: nessun errore (o errori parziali sotto la soglia).
+    """
+    hard = [r for r in results if r.status == "error"]
+    if hard:
+        return "error"
+    threshold = int((config or {}).get("run", {}).get("partial_error_threshold", 0))
+    partial = sum(len(r.errors or []) for r in results if r.status != "error")
+    return "warning" if partial > threshold else "ok"
+
+
 def run_all(config: dict | None = None, db_path: Path | str | None = None) -> tuple[list[ModuleResult], int]:
     """Esegue tutti i moduli abilitati. Torna (risultati, run_id del run_log)."""
     load_env()
@@ -65,8 +81,12 @@ def run_all(config: dict | None = None, db_path: Path | str | None = None) -> tu
             results.append(run_module(key, conn, conf, get_env))
             conn.commit()
 
-        errors = [f"{r.module_key}: {err}" for r in results for err in r.errors]
-        status = "ok" if not errors else "error"
+        status = classify_run(results, conf)
+        errors = (
+            [f"{r.module_key}: {err}" for r in results if r.status == "error" for err in r.errors]
+            if status == "error"
+            else [f"{r.module_key}: {err}" for r in results if r.errors for err in r.errors]
+        )
         db.finish_run_log(conn, run_id, status=status, finished_at=db.utcnow_iso(), errors=errors)
         conn.commit()
         return results, run_id

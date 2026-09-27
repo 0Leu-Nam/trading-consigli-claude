@@ -22,15 +22,18 @@ def _connect():
 
 
 def cmd_run_all(_args) -> int:
-    from core.orchestrator import run_all
+    from core.orchestrator import run_all, classify_run
+    from core.config import load_config
 
     results, run_id = run_all()
+    status = classify_run(results, load_config())
     print(f"run_id={run_id}")
     for r in results:
         print(f"  [{r.status}] {r.module_key}: rows={r.rows_written} note={r.note or '-'}")
         for err in r.errors:
             print(f"      ERRORE: {err}")
-    return 0 if all(r.status != "error" for r in results) else 1
+    print(f"run status={status}")
+    return 0 if status != "error" else 1
 
 
 def cmd_run(args) -> int:

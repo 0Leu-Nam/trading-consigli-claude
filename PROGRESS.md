@@ -2,10 +2,11 @@
 
 ## Stato attuale
 - Fase in corso: 4 — Modulo news_sentiment (notizie + sentiment)
-- Percentuale completamento fase: 95% (codice + test 76/76 + prova reale locale ok il 2026-09-24; **`enabled: false` per scelta: l'attivazione in produzione avviene solo dopo la chiusura formale di Fase 2/3 = 100% in questo file**).
+- Percentuale completamento fase: 95% (codice + test 81/81 + prova reale locale ok il 2026-09-24; **`enabled: false` per scelta: l'attivazione in produzione avviene solo dopo la chiusura formale di Fase 2/3 = 100% in questo file**).
 - Fase 3: 90% (implementata e validata; in parallelo alla osservazione cron di Fase 2).
 
 ## Ultima sessione conclusa
+- Sessione 2026-09-27: falso allarme "dati fermi al 24/09" archiviato come diagnosi; aggiunto lo status run `warning` per gli errori parziali (vedi "Problemi riscontrati").
 - Sessione 2026-09-24 (sera): Fase 4 implementata e validata in locale, produzione OFF.
 - File creati in Fase 4:
   - `modules/news_sentiment/sentiment.py` (lessico EN + `sentiment_score` [-1,1] e `sentiment_label` su soglia, funzioni pure)
@@ -16,7 +17,7 @@
   - `config.yaml` (sezione `news_sentiment` con parametri e **`enabled: false`**; `universe: file:data/sp500.txt`; `sources: [marketaux, yahoo_finance_rss]`)
 
 ## Verifiche di Fase 4 (locale, il 2026-09-24)
-- ✅ pytest 76/76 verdi.
+- ✅ pytest 81/81 verdi.
 - ✅ Prova reale su rete (DB temporaneo): 4 ticker coperti, 60 articoli da Yahoo RSS (nessuna chiave), 57 inseriti, secondo run 0 (idempotente), sentiment label presenti.
 - ✅ Test espliciti di isolamento fonti: Yahoo RSS che fallisce (HTTP/XML/network) non blocca Marketaux né il run; Marketaux giù non blocca Yahoo; feed malformato per 1 ticker lascia intatti gli altri.
 - ✅ Semantica status richiesta in seduta: fonti ok ma zero notizie nuove → `status: ok` con nota "nessuna notizia nuova (fonti ok)"; solo fallimento tecnico di TUTTE le fonti → `status: error`.
@@ -49,7 +50,15 @@
 - PyYAML 1.1 parsa `on:` come booleano → falso errore di validazione locale; GitHub usa YAML 1.2, `on:` è corretto. Nessuna azione.
 - Auto-commit con GITHUB_TOKEN dedicato (`contents: write`): zero secret/carta; i commit bot non ri-innescano il workflow (nessun loop) e tengono il repo attivo (cron non disattivato a 60gg nei repo privati).
 - `concurrency` con `cancel-in-progress: false`: i 2 run/giorno non si sovrappongono (sicurezza WAL e auto-commit).
-- **Ritardi cron osservati (2026-09-25)**: due run consecutivi dello schedule hanno avuto ritardi rilevanti rispetto all'orario previsto — il run atteso alle 13:00 UTC è partito con ~4h44min di ritardo, quello atteso alle 21:00 UTC con ~2h45min. Ipotesi: congestione dei runner GitHub Actions nella fascia oraria "tonda" (:00) condivisa da migliaia di workflow. **Decisione**: schedule spostato a minuto non standard `17` (`17 13,21 * * *` → 13:17 e 21:17 UTC) per uscire dal picco. Verifica attesa: i prossimi run autopartiti dovrebbero iniziare entro pochi minuti dall'orario esatto; la voce verrà aggiornata (o rivista) in base all'esito. Nessun dispatch manuale di controllo: l'obiettivo è osservare proprio il comportamento del cron automatico.
+- **Ritardi cron osservati (2026-09-25)**: due run consecutivi dello schedule hanno avuto ritardi rilevanti rispetto all'orario previsto — il run atteso alle 13:00 UTC è partito con ~4h44min di ritardo, quello atteso alle 21:00 UTC con ~2h45min. Ipotesi: congestione dei runner GitHub Actions nella fascia oraria "tonda" (:00) condivisa da migliaia di workflow. **Decisione**: schedule spostato a minuto non standard `17` (`17 13,21 * * *` → 13:17 e 21:17 UTC) per uscire dal picco. (Esito, vedi voce "Cron impreciso accettato".)
+- **Cron impreciso accettato (2026-09-27)**: l'osservazione successiva mostra ritardi sistematici di 2-4h e slot saltati — limite noto del tier gratuito GitHub Actions, non risolvibile col minuto non standard. **Verifica di recupero per modulo** (finestre di lookback vs un run ritardato di ore o un intero slot saltato, fino a ~32h di gap):
+  - `insider_trading`: finestra scorrevole di 7 giorni ri-fetchata per intero a ogni run (SEC full-text su `[today-7, today]`, data di filing), insert idempotente → un run ritardato o una finestra saltata vengono recuperati integralmente; perdita permanente solo con >7 giorni di inattività.
+  - `price_screener`: `period_days: 30` (ri-download completo dello storico a ogni run, salva gli ultimi `history_days: 25` con UNIQUE(symbol,date)) → buchi fino a ~4 settimane riempiti dal run successivo.
+  - `news_sentiment`: pull sugli articoli correnti del feed (Yahoo RSS ~15-25 top, Marketaux), senza lookback temporale → un ritardo di 2-4h o uno slot saltato non fa cadere articoli (il feed trattiene i recenti); perdita solo con inattività plurigiornaliera. Modulo ancora `enabled: false` (Fase 4 non attivata).
+  - **Conclusione**: il cron resta impreciso (`17 13,21 * * *`, nessun ulteriore tuning) e va bene così: il caso d'uso (poche operazioni/anno) non richiede tempestività e nessun modulo subisce perdita permanente di dati da slot ritardati o saltati.
+- **Diagnosi "dati fermi al 24/09" (2026-09-27)**: falso allarme. Il clone locale era rimasto al commit `b7cc542`; i commit bot del 26/09 esistono e i dati progrediscono — insider 543→646→681 righe, price max date 24→25 (la barra del venerdì è comparsa nel run di sabato: ritardo di pubblicazione Yahoo, nessuna perdita). Lo slot 13:17 di ven 25 è saltato integralmente (nessun run creato): coerente con la voce "Cron impreciso accettato". Fonte di verità usata nel dubbio: DB remoti letti commit-per-commit via API (log di dettaglio non leggibili senza privilegi admin).
+- **Colonna `filing_date` = `periodOfReport`, NON data di deposito**: in `insider_transactions` il parser salva `periodOfReport` (fine del periodo di rendicontazione, ~ data dell'ultima transazione riportata) e la data di deposito EFTS (`file_date`) non viene salvata — ecco perché `MAX(filing_date)` può restare vecchio mentre arrivano depositi nuovi. NOTA DI MANUTENZIONE FUTURA: aggiungere una colonna `filed_date` (da `FilingDiscovery.filing_date`); un eventuale rename di `filing_date` richiede migrazione + view per retrocompatibilità (i consumer esistenti la usano). Nessun rename ora.
+- **Nuovo status run `warning` (2026-09-27)**: prima, un qualsiasi errore parziale (es. 1 filing irrecuperabile su 250, `0001437749-26-031259`) marcava l'intero `run_log` come `error` pur con job verde. Ora `core.orchestrator.classify_run`: `error` solo se almeno un modulo fallisce del tutto (status `error`); `warning` se gli errori parziali superano `run.partial_error_threshold` (default 0 → qualsiasi anomalia > 0); `ok` altrimenti. Exit code invariato (0 per ok/warning, 1 per error); `cli run-all` stampa `run status=...`. Toccati: orchestrator, cli, config.yaml, test_orchestrator.
 - Primo run CI lento (~6-9 min) per 250 filing × 2 richieste SEC: normale; se in futuro i run CI di SEC dovessero superare i 10-15 min (rate limit sugli IP GitHub), abbassare `max_filings`.
 
 ## Criteri di successo Fase 3 (locale, già verificati il 2026-09-24)
