@@ -1,11 +1,15 @@
 # PROGRESS.md — Registro di continuità tra sessioni
 
 ## Stato attuale
-- Fase in corso: 4 — Modulo news_sentiment (notizie + sentiment)
-- Percentuale completamento fase: 95% (codice + test 81/81 + prova reale locale ok il 2026-09-24; **`enabled: false` per scelta: l'attivazione in produzione avviene solo dopo la chiusura formale di Fase 2/3 = 100% in questo file**).
-- Fase 3: 90% (implementata e validata; in parallelo alla osservazione cron di Fase 2).
+- Fase in corso: 5 — institutional_holdings (13F trimestrale, SEC EDGAR)
+- Percentuale completamento fase: 0% (da avviare).
+- Fase 4: 100% — `news_sentiment` **attivata in produzione** (`enabled: true`, 2026-09-30).
+- Fase 3: 100% — validata in produzione.
+- Fase 2: 100% — workflow Actions autonomo, osservazione conclusa.
+- Fase 1: 100%.
 
 ## Ultima sessione conclusa
+- **Sessione 2026-09-30 — flip Fase 4 e chiusura Fase 2/3**: `news_sentiment.enabled: true`; `tests/test_config.py` aggiornato a 3 moduli attivi (81/81 verdi). Osservazione di chiusura: **6 run consecutivi dopo l'introduzione dello status `warning`, tutti `ok` senza errori parziali, oltre 6 giorni di funzionamento autonomo** del cron (cron stabile, nessun warning imprevisto, dati insider/prezzo in avanzamento). Prossima run di produzione prevista con i 3 moduli attivi.
 - Sessione 2026-09-27: falso allarme "dati fermi al 24/09" archiviato come diagnosi; aggiunto lo status run `warning` per gli errori parziali (vedi "Problemi riscontrati").
 - Sessione 2026-09-24 (sera): Fase 4 implementata e validata in locale, produzione OFF.
 - File creati in Fase 4:
@@ -67,12 +71,10 @@
 - ✅ Idempotenza: secondo run = 0 righe nuove (UNIQUE symbol+date).
 - ✅ Anomalie interrogabili: query su `vol_vs_avg_20`/`abs_return_5d` del giorno più recente restituisce spike sensati (es. WBD vol_ratio 3.72, MCD -4.8% in 1d).
 - ✅ Azioni di classe gestite: BRK.B e BF.B presenti con dati.
-- ⏳ DA VERIFICARE SUL TUO ACCOUNT GITHUB: confondere il nuovo `run` CI (una esecuzione con entrambi i moduli) → poi guardare per 3-5 giorni l'autonomia del cron; a quel punto PROGRESS → "Fase 2 = 100%" e Fase 3 → 100% (validata in produzione).
+- ✅ Validata in produzione: osservazione conclusa il 2026-09-30 dopo 6+ giorni e 6 run consecutivi tutti `ok` senza errori parziali; il new run CI con 3 moduli (Fase 4 inclusa) viene verificato sul prossimo ciclo.
 
 ## Prossimo step esatto
-1. Push delle modifiche di Fase 4 (codice + test; `news_sentiment.enabled: false`) via commit esplicito.
-2. Continuare l'osservazione dei 3-5 giorni di cron autonomo (Fase 2) con `price_screener` attivo (Fase 3).
-3. Alla scadenza: aggiornare PROGRESS.md a "Fase 2 = 100%" e "Fase 3 = 100%", poi **attivare Fase 4** con una sola modifica: `news_sentiment.enabled: true` + aggiornare `tests/test_config.py` (3 moduli attivi) + run reale + push.
-4. Avviare la **Fase 5 — institutional_holdings (13F trimestrale, SEC EDGAR)**: riusa il pattern di Fase 1 (EFTS `forms=13F-HR`), le tabelle dello schema esistono già.
+1. Push del flip Fase 4 (config.yaml, tests/test_config.py, PROGRESS.md), poi osservare il primo cron con 3 moduli attivi: atteso `[ok] insider_trading`, `[ok] price_screener`, `[ok] news_sentiment` e `news_events` > 0 nel DB di produzione; in caso di quota Marketaux esaurita, il modulo degrada a Yahoo RSS senza errori (testata in isolamento).
+2. Avviare la **Fase 5 — institutional_holdings (13F trimestrale, SEC EDGAR)**: riusa il pattern di Fase 1 (EFTS `forms=13F-HR`), le tabelle dello schema esistono già.
 
 Nota per Fase 7 (da non dimenticare): dividere in 7a (dashboard tabellare pura) e 7b (aggiunta sezione discorsiva via template, non LLM, per non rompere la tabella già funzionante). Vedi conversazione Claude del 24/09 per dettaglio completo del prompt.

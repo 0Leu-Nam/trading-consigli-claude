@@ -10,8 +10,8 @@ def test_default_config_loads_without_keys():
     assert "modules" in conf
     assert "database" in conf
     assert conf["database"]["path"] == "data/app.db"
-    # Fase 3: insider_trading e price_screener sono abilitati, il resto resta off
-    expected_enabled = {"insider_trading", "price_screener"}
+    # Fase 4 attivata: insider_trading, price_screener e news_sentiment sono abilitati
+    expected_enabled = {"insider_trading", "price_screener", "news_sentiment"}
     assert all(
         isinstance(item, dict)
         and item.get("enabled") == (key in expected_enabled)
@@ -19,9 +19,9 @@ def test_default_config_loads_without_keys():
     )
 
 
-def test_enabled_modules_returns_fase3_modules():
+def test_enabled_modules_returns_fase4_modules():
     conf = cfg.load_config()
-    assert cfg.enabled_modules(conf) == ["insider_trading", "price_screener"]
+    assert cfg.enabled_modules(conf) == ["insider_trading", "price_screener", "news_sentiment"]
 
 
 def test_enabled_modules_returns_only_enabled_modules():
