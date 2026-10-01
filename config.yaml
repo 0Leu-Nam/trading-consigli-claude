@@ -31,7 +31,15 @@ modules:
     lookback_insider_days: 7
     universe: file:data/sp500.txt
   institutional_holdings:
-    enabled: false          # FASE 5 — 13F (trimestrale)
+    enabled: false          # FASE 5 — 13F trimestrale (attivare dopo verifica locale + osservazione)
+    lag_days: 45            # ritardo pubblicazione 13F: processa solo trimestri chiusi da almeno 45gg
+    quarters_back: 2        # quanti trimestri chiusi per run (più recente prima)
+    max_filings: 120        # cap filing per run (~120×2 GET ≈ 85s; i 13F sono ~9.200/trimestre)
+    max_filings_scan: 2000  # hit EFTS esaminate per trimestre (solo pagine di ricerca, costo ~0)
+    skip_put_call: true     # scarta le posizioni su opzioni (putCall valorizzato)
+    cusip_ttl_days: 60      # validità della cache cusip_lookup prima di ri-risolvere il nome
+    core_name_matching: true  # 2° tier: match sui token del nome senza suffissi legali (es. "CHEVRON CORPORATION" → "CHEVRON CORP"); solo se univoco
+    filer_cik_filter: []    # CIK 10 cifre dei gestori da processare per primi (vedi README); vuoto = ordine EFTS
 
 notifications:
   telegram:

@@ -8,15 +8,19 @@ Convenzioni per evitare conflitti tra moduli:
 - idempotenza garantita da chiavi naturali UNIQUE + INSERT OR IGNORE.
 """
 
+import logging
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 2
 
 EXPECTED_TABLES = {
     "companies",
     "insider_transactions",
     "institutional_holdings",
+    "cusip_lookup",
     "price_snapshots",
     "news_events",
     "signals",
@@ -62,11 +66,22 @@ CREATE TABLE IF NOT EXISTS institutional_holdings (
     filing_quarter TEXT NOT NULL,
     filing_date    TEXT,
     filer_name     TEXT,
-    cik            TEXT,
+    filer_cik      TEXT,
+    issuer_name    TEXT,
+    cusip          TEXT,
     shares         INTEGER,
     value_usd      INTEGER,
     shares_delta   INTEGER,
-    UNIQUE (filing_quarter, filer_name, company_id)
+    UNIQUE (filing_quarter, filer_cik, cusip)
+);
+
+CREATE TABLE IF NOT EXISTS cusip_lookup (
+    cusip       TEXT PRIMARY KEY,
+    company_id  INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+    ticker      TEXT,
+    issuer_name TEXT,
+    source      TEXT,
+    resolved_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS price_snapshots (
@@ -153,6 +168,47 @@ def init_schema(db_path: Path | str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
     with connect(path) as conn:
         conn.executescript(_SCHEMA)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        _migrate_institutional_holdings(conn)
+        # Dopo la migrazione la tabella è sicuramente v2: qui l'indice su
+        # (filer_cik, cusip) che serve al calcolo di shares_delta.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_holdings_filer_cusip"
+            " ON institutional_holdings (filer_cik, cusip)"
+        )
+
+
+def _has_cusip_columns(conn) -> bool:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(institutional_holdings)")}
+    return "cusip" in cols and "filer_cik" in cols
+
+
+def _migrate_institutional_holdings(conn) -> None:
+    """Ricostruisce institutional_holdings sullo schema v2 (idempotente).
+
+    Lo schema v1 aveva la colonna ``cik`` e la chiave UNIQUE
+    (filing_quarter, filer_name, company_id), troppo debole: il nome del
+    gestore non è univoco e non permette il debug quando il matching del
+    CUSIP fallisce. Il v2 usa UNIQUE (filing_quarter, filer_cik, cusip) e
+    conserva il CUSIP originale (cusip) e il nome emittente (issuer_name).
+    """
+    if _has_cusip_columns(conn):
+        return
+    logger.info("Migrazione schema: institutional_holdings v1 -> v2")
+    conn.execute("DROP TABLE IF EXISTS institutional_holdings_legacy")
+    conn.execute("ALTER TABLE institutional_holdings RENAME TO institutional_holdings_legacy")
+    conn.executescript(_SCHEMA)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO institutional_holdings
+            (id, company_id, filing_quarter, filing_date, filer_name, filer_cik,
+             issuer_name, cusip, shares, value_usd, shares_delta)
+        SELECT id, company_id, filing_quarter, filing_date, filer_name, cik,
+               NULL, NULL, shares, value_usd, shares_delta
+        FROM institutional_holdings_legacy
+        """
+    )
+    conn.execute("DROP TABLE institutional_holdings_legacy")
 
 
 def table_names(db_path: Path | str) -> set[str]:

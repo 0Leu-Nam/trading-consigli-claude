@@ -2,14 +2,15 @@
 
 ## Stato attuale
 - Fase in corso: 5 — institutional_holdings (13F trimestrale, SEC EDGAR)
-- Percentuale completamento fase: 0% (da avviare).
+- Percentuale completamento fase: implementazione e test locali COMPLETI (127/127 verdi), modulo **ancora `enabled: false`** → manca il flip dopo osservazione.
 - Fase 4: 100% — `news_sentiment` **attivata in produzione** (`enabled: true`, 2026-09-30).
 - Fase 3: 100% — validata in produzione.
 - Fase 2: 100% — workflow Actions autonomo, osservazione conclusa.
 - Fase 1: 100%.
 
 ## Ultima sessione conclusa
-- **Sessione 2026-09-30 — flip Fase 4 e chiusura Fase 2/3**: `news_sentiment.enabled: true`; `tests/test_config.py` aggiornato a 3 moduli attivi (81/81 verdi). Osservazione di chiusura: **6 run consecutivi dopo l'introduzione dello status `warning`, tutti `ok` senza errori parziali, oltre 6 giorni di funzionamento autonomo** del cron (cron stabile, nessun warning imprevisto, dati insider/prezzo in avanzamento). Prossima run di produzione prevista con i 3 moduli attivi.
+- **Sessione 2026-09-30 — Fase 5 implementata (13F), produzione OFF**: modulo, schema v2, test e documentazione; `institutional_holdings.enabled: false`. Dettagli e verifiche nelle sezioni "Verifiche di Fase 5" e "Problemi riscontrati".
+- **Sessione 2026-09-30 — flip Fase 4 e chiusura Fase 2/3**: `news_sentiment.enabled: true`; `tests/test_config.py` aggiornato a 3 moduli attivi (81/81 verdi). Osservazione di chiusura: **6 run consecutivi dopo l'introduzione dello status `warning`, tutti `ok` senza errori parziali, oltre 6 giorni di funzionamento autonomo** del cron (cron stabile, nessun warning imprevisto, dati insider/prezzo in avanzamento).
 - Sessione 2026-09-27: falso allarme "dati fermi al 24/09" archiviato come diagnosi; aggiunto lo status run `warning` per gli errori parziali (vedi "Problemi riscontrati").
 - Sessione 2026-09-24 (sera): Fase 4 implementata e validata in locale, produzione OFF.
 - File creati in Fase 4:
@@ -38,7 +39,54 @@
   - `tests/test_config.py` (ora i moduli attesi attivi sono `insider_trading` + `price_screener`)
   - `.env.example` (aggiunto `STOOQ_API_KEY`)
 
+## Verifiche di Fase 5 — institutional_holdings (locale, il 2026-09-30)
+- ✅ pytest **139/139** verdi.
+- ✅ Prova reale su rete (DB temporaneo `probe_13f_final.db`, 2 trimestri con budget 4 filing/trimestre): 8 filing reali analizzati, **120 posizioni** in 119 company, 21 s di run; secondo run **0 righe** (idempotente); schema `user_version = 2` verificato sul DB.
+- ✅ Il guard `period_ending` ha scartato **4 depositi su 8** con periodo diverso dal trimestre della finestra (correzione resa necessaria dai dati reali, non ipotetica).
+- ✅ Mapping CUSIP→ticker via sola EDGAR `company_tickers.json` (10.431 voci, 8.006 chiavi normalizzate uniche): **102 CUSIP unici risolti su 329 (31%)** nel campione da 8 filing, di cui 81 `edgar_name` (esatto) e 21 `edgar_core` (forme legali). Dopo il gate sull'evidenza **0 righe attribuite a SPGI/WT** (era 7+2): regressioni coperte da test.
+- ✅ Analisi delle 218→227 cause di mancata risoluzione (misurata, vedi "Perché il 31%"): 70% sono fondi/ETF assenti dalla mappa EDGAR, non un difetto di matching.
+- ✅ Idempotenza e isolamento testati: 2° run = 0 righe; un filing irrecuperabile non ferma gli altri (1 errore parziale → status `ok` + `errors[]`); fallimento EFTS → status `error`; errore non previsto su un singolo CUSIP → `errors[]`, run prosegue.
+- ✅ Criteri scartati esplicitamente e conteggiati in `note`: opzioni (`putCall`), righe `sshPrnamtType=PRN` (obbligazioni/fondi), righe senza quote, depositi con `period_ending` fuori trimestre.
+- File creati in Fase 5:
+  - `modules/institutional_holdings/edgar_13f.py` (EFTS `forms=13F-HR` con paginazione/deduplica per accession, discovery dell'information table via `index.json`, parsing namespace-agnostic, retry/backoff fair-access, `SecEdgarError` typed)
+  - `modules/institutional_holdings/cusip_map.py` (`cusip_lookup` come cache CUSIP→azienda, TTL `cusip_ttl_days`, match EDGAR esatto + "core" sui token con guard di ambiguità e gate sull'evidenza, override manuale possibile)
+  - `modules/institutional_holdings/module.py` (`target_quarters` con lag, `select_filings` con whitelist CIK, `period_matches_quarter`, `shares_delta` vs trimestre precedente)
+  - `tests/test_13f_parse.py`, `tests/test_13f_discovery.py`, `tests/test_cusip_map.py`, `tests/test_13f_quarters.py`, `tests/test_institutional_module.py`
+- File modificati in Fase 5:
+  - `core/db.py` (`SCHEMA_VERSION` 1→2, tabella `cusip_lookup`, `institutional_holdings` con `filer_cik`/`issuer_name`/`cusip` e `UNIQUE(filing_quarter, filer_cik, cusip)`, migrazione automatica v1→v2 idempotente, indice `(filer_cik, cusip)`)
+  - `config.yaml` (sezione `institutional_holdings` con **`enabled: false`** + `filer_cik_filter`, `core_name_matching`, `cusip_ttl_days`, `max_filings_scan`)
+  - `tests/test_db_schema.py` (schema v2 + migrazione da DB v1)
+  - `README.md` (sezione "Come trovare il CIK di un gestore" + override manuale di un CUSIP non risolto)
+
+## Perché il 31% dei CUSIP non risolve (analisi misurata, campione 329 CUSIP da 8 filing)
+Smistamento dei 227 CUSIP non risolti, pesato sui CUSIP (non sui nomi: gli 92 nomi distinti contengono molte righe di ETF trust):
+
+| Causa | CUSIP | % | Normalizzabile? |
+|---|---|---|---|
+| Fondi/ETF trust **assenti** dalla mappa EDGAR | 153 | 70% | No: i CUSIP non esistono nella fonte |
+| Società quotate con abbreviazioni in stile 13F | 47 | 22% | Sì, con dizionario abbreviazioni (non fatto: lavoro separato) |
+| Emittente univoco (CIK unico) ma ticker multiplo | 18 | 8% | Serve una decisione di prodotto, non normalizzazione |
+| Ambiguo cross-emittente (CIK diversi) | 0 | 0% | — |
+
+Prove della prima riga: in `company_tickers.json` solo **324 titoli su 10.431 (3,1%)** contengono parole da fondo (TRUST/FUND/ETF/TR/SERIES) e **zero** voci per QQQ, DIMENSIONAL, GLOBAL X, SP500; `ISHARES TR` da sola vale 52 CUSIP e non ha alcuna corrispondenza. Per lo screening su S&P 500 questo è in buona parte desiderabile: un gestore che detiene SPY non è un segnale di stock picking.
+
+- **Il caso Alphabet è un limite di fonte, non di normalizzazione.** Nel 13F-HR di Berkshire (`0001193125-26-352200`, deposito 2026-08-14, periodo 2026-06-30) le righe sono `nameOfIssuer` = `ALPHABET INC` con `titleOfClass` = `CAP STK CL A` (CUSIP 02079K305) e `CAP STK CL C` (02079K107); in `company_tickers.json` esistono **4 voci** tutte titolate `Alphabet Inc.` (GOOGL, GOOG, GOOGM, GOOGN, CIK 1652044). Il nome matcha esattamente: è il *ticker* a essere indeterminato, perché EDGAR non riporta la classe mentre la 13F sì. Stesso pattern per `AT&T INC` (T/TBB/T-PA/T-PC) e `JPMORGAN CHASE & CO` (9 ticker). **Decisione 2026-09-30: lasciare non risolti** (niente euristiche sul ticker primario, nessuna nuova colonna); restano tracciati in `cusip_lookup` e risolvibili con override manuale.
+- **Normalizzazione dei soli suffissi: guadagno 0** (verificato). I suffissi sono già gestiti; il residuo sono abbreviazioni interne al nome (`MATLS`→MATERIALS, `SYS`→SYSTEMS, `MOB`→MOBIL, `MTR`→MOTOR, `AMER`→AMERICA, `ELEC`→ELECTRIC, `FINL`→FINANCIAL, `MNG`→MINING, `MACHS`→MACHINES, `HLDG`→HOLDINGS) più rumore da scartare (`NEW`, `FORMERLY`, `DEL`). Con un dizionario validato il tasso sale a **~50-53%**: lavoro separato, non fatto in questo commit.
+- **Falso positivo corretto prima del commit (2026-09-30)**: `core_key` scartava anche contenitori di fondi e lettere singole, quindi `GLOBAL X FDS` → `('GLOBAL',)` collideva con `S&P Global Inc.` → `('GLOBAL',)` e **7 CUSIP di ETF finivano su SPGI** (titolo dell'indice), più 2 su `WISDOMTREE TR` → `WT`. Fix: `_LEGAL_FORM_TOKENS` (scarti innocui) separati da `_NOISE_TOKENS`, gate `core_match_is_reliable` (≥2 token core oppure scarti tutti legali) applicato **a ciascun lato**. Risultato verificato: 0 righe SPGI/WT, 21 match `edgar_core` superstiti tutti corretti (NVIDIA, Chevron, Mastercard, RTX, SLB, Baker Hughes, e i fondi con titolo EDGAR corrispondente: IAU, GLD, SLV, FETH, ETHE, BITB), tasso 34%→31%. Costo della precisione: 9 CUSIP in meno risolti.
+- **Caso residuo a bassa confidenza**: `US BANCORP` → `USB` (1 CUSIP) passa perché `pick()` preferisce l'unico ticker "pulito" fra 7 della stessa società; la classe effettiva non è verificabile dalla fonte. Se in futuro desse fastidio, si esclude con override.
+
 ## Problemi riscontrati e decisioni prese
+- **Nessuna mappa CUSIP→ticker su EDGAR**: `company_tickers.json` ha solo `{cik_str, ticker, title}` e le information table 13F hanno solo CUSIP + `nameOfIssuer` (nessun ticker/CIK emittente). Scelta v1: **solo EDGAR via name-match**, niente OpenFIGI (costo zero), con i CUSIP non risolti tracciati in `cusip_lookup` e ritentati a ogni run.
+- **Nomi 13F non standardizzati** (verificati su dati reali): `CHEVRON CORP` vs `CHEVRON CORPORATION`, `DISNEY WALT CO` vs `Walt Disney Co`, `AMAZON COM INC` vs `Amazon.com Inc`, titoli con suffisso `/DE/` o `PLC`. Prima soluzione (match esatto normalizzato) lasciava 187 CUSIP unici non risolti su 4 filing → aggiunto **tier 2 "core"** (token esclusi i suffissi legali, accettato solo se univoco): 97→114 posizioni risolte, 187→170 non risolti su quel campione.
+- **Classi multiple lasciate volutamente non risolte**: `GOOG`/`GOOGL` condividono il titolo EDGAR "Alphabet Inc.", quindi il guard di ambiguità scarta entrambe invece di attribuire la classe C alla classe A. Prezzo dell'alta precisione: 2 righe in meno nel campione di prova (verificato anche nel probe finale). Mitigazione documentata: override manuale in `cusip_lookup`.
+- **`display_names` EFTS contiene il suffisso "(CIK 0001067983)"** e può arrivare come lista o come stringa: i nomi vengono ripuliti (`clean_display_name`) e MAI splittati sugli spazi (splittare avrebbe dato `filer_name = "BERKSHIRE"`).
+- **Il nome del file dell'information table non è fisso** (`InfoTable.xml`, `spartawq2.xml`, …): si usa `index.json` + recognition della root (`informationTable`) invece di indovinare il filename.
+- **`period_ending` va validato**: nei dati reali **4 depositi su 8** nella finestra Q2 2026 avevano un `period_ending` diverso dal trimestre (es. un 13F depositato il 14/08/2026 con `period_ending` 2024-12-31) e, senza controllo, sarebbero stati etichettati `2026Q2`. Aggiunto `period_matches_quarter`: il trimestre è quello del FILING, non quello della finestra di deposito.
+- **`value` 13F ha unità inconsistenti**: la regola SEC è migliaia di dollari, ma alcuni filer riportano dollari → `value_usd` salvato GREZZO e documentato, senza conversione (le colonne si chiamano comunque `*_usd` per coerenza con le altre tabelle).
+- **`sshPrnamtType` distingue SH da PRN**: le righe `PRN` (principal amount di obblazioni/fondi/trust) hanno un numero che sembra quote ma non lo è → scartate e conteggiate (`non-SH scartate`), altrimenti finirebbero nello score azionario.
+- **Volume depositi 13F**: ~9.214 depositi nel solo Q2 2026 → budget `max_filings` (120) e `max_filings_scan` (2000), con `filer_cik_filter` per i gestori di interesse. Con budget 120 e ~2 richieste SEC per filing il run resta compatibile con i tempi del cron.
+- **Filings duplicati**: EFTS indicizza documenti, non filing → deduplica per `accession`.
+- Console Windows cp1252 in crash sui caratteri Unicode negli script di diagnostica (`UnicodeEncodeError` su `→`): i probe temporanei vanno scritti con output ASCII.
 - **Finviz non ha un feed RSS per-ticker**: `news.ashx?v=3&t=TICKER` è HTML ("Stocks News" generale), `rss.ashx` è 404 → fonte senza chiave scelta: **RSS per-ticker di Yahoo Finance** (`feeds.finance.yahoo.com/rss/2.0/headline?s=...`) con `guid` come uuid e normalizzazione RFC822→ISO.
 - **Marketaux free plan**: 100 richieste/giorno e 3 articoli/richiesta → 1 richiesta per simbolo, cap 40 ticker/run = max 80/giorno con 2 cron, dentro la quota. Se in futuro la quota si esaurisse: ridurre `max_symbols` o attivare Marketaux solo sul tier prioritario.
 - **Ridondanza uuid**: lo stesso articolo può comparire nei feed RSS di due ticker → UNIQUE(uuid) + INSERT OR IGNORE evitano i duplicati (vince il primo simbolo processato; ok per lo screening).
@@ -74,7 +122,14 @@
 - ✅ Validata in produzione: osservazione conclusa il 2026-09-30 dopo 6+ giorni e 6 run consecutivi tutti `ok` senza errori parziali; il new run CI con 3 moduli (Fase 4 inclusa) viene verificato sul prossimo ciclo.
 
 ## Prossimo step esatto
-1. Push del flip Fase 4 (config.yaml, tests/test_config.py, PROGRESS.md), poi osservare il primo cron con 3 moduli attivi: atteso `[ok] insider_trading`, `[ok] price_screener`, `[ok] news_sentiment` e `news_events` > 0 nel DB di produzione; in caso di quota Marketaux esaurita, il modulo degrada a Yahoo RSS senza errori (testata in isolamento).
-2. Avviare la **Fase 5 — institutional_holdings (13F trimestrale, SEC EDGAR)**: riusa il pattern di Fase 1 (EFTS `forms=13F-HR`), le tabelle dello schema esistono già.
+1. **Commit e push della Fase 5** (a cura dell'utente): `core/db.py`, `modules/institutional_holdings/*` (3 file), `config.yaml`, `tests/test_13f_*.py`, `tests/test_cusip_map.py`, `tests/test_institutional_module.py`, `tests/test_db_schema.py`, `README.md`, `PROGRESS.md`. Il flip resta **fuori** da questo commit: `institutional_holdings.enabled: false` e `data/app.db` non modificato.
+2. Dopo il push, osservare il cron **senza** il modulo 13F per confermare che i 3 moduli attivi siano ancora verdi (nessuna regressione da schema v2: la migrazione non deve toccare le tabelle degli altri moduli).
+3. Poi avviare l'osservazione della Fase 5: ATTIVARE `institutional_holdings.enabled: true` **solo** con `quarters_back: 1` e `max_filings` basso (es. 20) per un primo run di prova in produzione, verificando nel DB remoto che `institutional_holdings` e `cusip_lookup` si popolano e che `run_log` resti `ok` (o `warning` per CUSIP non risolti, che sono attesi e NON devono far fallire il run). Solo dopo 2-3 run `ok` aumentare `max_filings` e impostare `filer_cik_filter` con i CIK dei gestori di interesse (vedi guida in README.md).
+
+## Limiti noti di Fase 5 (per le fasi successive)
+- Tasso di risoluzione CUSIP ~34-40% (misurato su due campioni: 4 e 8 filing): i mancati sono in prevalenza fondi/ETF/obbligazioni/società estere, che per il nostro uso (azioni S&P 500) sono marginali, ma **non** sono marginali le azioni con classi multiple (es. Alphabet GOOG/GOOGL), lasciate apposta non risolte per non attribuire la classe sbagliata.
+- Il tasso di risoluzione migliora nel tempo: `cusip_lookup` conserva i nomi e i CUSIP non risolti e li ritenta a ogni run (`cusip_ttl_days`), quindi un override manuale o un futuro mapping più ampio può recuperarli senza rimettere mano ai filing già scaricati.
+- `value_usd` non è confrontabile in assoluto tra filer diversi (unità grezza): utilizzabile per delta e ranking *all'interno* dello stesso filer, non per confrontare il valore totale di due gestori diversi.
+- La finestra di deposito è `[q_end+1, q_end+lag_days]`: i depositi in ritardo oltre il lag (rare, più tipici con `13F-HR/A` o ritardi dell'istruttore) vengono ignorati da soli; per recuperarli serve `quarters_back` più ampio o un allineamento del `filing_quarter` al `period_ending` reale (oggi scartati se fuori finestra).
 
 Nota per Fase 7 (da non dimenticare): dividere in 7a (dashboard tabellare pura) e 7b (aggiunta sezione discorsiva via template, non LLM, per non rompere la tabella già funzionante). Vedi conversazione Claude del 24/09 per dettaglio completo del prompt.
