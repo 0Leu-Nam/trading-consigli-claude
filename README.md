@@ -39,8 +39,15 @@ ricava il ticker dal nome dell'emittente confrontandolo con la mappa EDGAR
 `company_tickers.json`. I **CUSIP non risolti** restano tracciati in
 `cusip_lookup` e vengono ritentati a ogni run.
 
-`filer_cik_filter` serve per dare la precedenza ai 13F dei grandi gestori
+`filer_cik_filter` serve per dare la precedenza ai 13F dei gestori scelti
 invece di prendere i depositi più recenti.
+
+> **Attenzione: è una coda di priorità, non un filtro esclusivo.** I CIK in
+> lista vengono selezionati per primi, ma il budget `max_filings` viene
+> comunque riempito con altri filer. Per processare **solo** i gestori
+> indicati, il numero di CIK deve essere uguale o vicino a `max_filings`
+> (nella config attuale: 3 CIK con `max_filings: 6`, per lasciare margine
+> agli eventuali 13F-HR/A).
 
 ### 1. Trovare il CIK
 - **EDGAR full-text search**: https://efts.sec.gov/LATEST/search-index?q=NOME&forms=13F-HR
@@ -55,10 +62,16 @@ Il CIK si scrive a **10 cifre con zeri iniziali** (accettato anche senza zeri):
 
 ```yaml
 institutional_holdings:
-  filer_cik_filter: ["0001067983", "0001350694"]
-  #                 0001067983 = Berkshire Hathaway Inc   (verificato 2026-09-30 su EFTS)
-  #                 0001350694 = Bridgewater Associates, LP (verificato 2026-09-30 su EFTS)
+  filer_cik_filter: ["0001541617", "0002045724", "0001263508"]
+  #                 0001541617 = Altimeter Capital Management, LP (verificato 2026-10-01)
+  #                 0002045724 = Situational Awareness LP           (verificato 2026-10-01)
+  #                 0001263508 = Baker Bros. Advisors LP           (verificato 2026-10-01)
 ```
+
+Sono i tre gestori usati in produzione: piccoli e concentrati, scelti per
+individuare mosse ad alta convinzione su titoli non ancora enormi. I CIK
+vanno verificati sempre su EFTS (o con `https://data.sec.gov/submissions/CIK<CIK>.json`):
+un CIK sbagliato non produce errori, semplicemente **zero righe in silenzio**.
 
 ### 3. Override manuale di un CUSIP non risolto
 Se un CUSIP importante resta non risolto, si può inserire a mano la
