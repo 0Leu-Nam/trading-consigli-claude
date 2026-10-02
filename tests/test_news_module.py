@@ -3,7 +3,14 @@
 Coprono in modo esplicito l'isolamento tra fonti richiesto in Fase 4:
 un fallimento/cambiamento di formato di una fonte non deve bloccare le altre
 né l'intero run, e la semantica di status distingue i casi.
+
+Attenzione alle date: i moduli filtrano su date relative a `date.today()`
+(lookback). I test che simulano dati "recenti" devono costruire le date
+rispetto a oggi, mai con valori assoluti, altrimenti il test si rompe da solo
+dopo qualche giorno senza che cambi nulla nel codice.
 """
+
+from datetime import date, timedelta
 
 from core import db
 from core.module_interface import RunContext
@@ -53,15 +60,21 @@ def test_select_tickers_priority_insider_then_watchlist_then_universe(tmp_path):
     c = db.upsert_company(conn, "CCC")
     d = db.upsert_company(conn, "DDD")
     conn.execute("INSERT INTO watchlist (company_id, status) VALUES (?, 'watch')", (b,))
+    # Date RELATIVE a oggi, non assolute: select_tickers calcola il cutoff da
+    # date.today() - lookback_insider_days. Con una data assoluta il test
+    # invecchia e fallisce da solo al passare dei giorni (è successo il
+    # 2026-10-01 con un filing finto del 2026-09-24 e lookback di 7gg).
+    recent = (date.today() - timedelta(days=1)).isoformat()
+    stale = (date.today() - timedelta(days=90)).isoformat()
     conn.execute(
         "INSERT INTO insider_transactions (company_id, accession, row_no, filing_date, transaction_type, url) "
         "VALUES (?, 'X1', 0, ?, 'P', NULL)",
-        (c, "2026-09-24"),  # recente → priorità massima
+        (c, recent),  # recente → priorità massima
     )
     conn.execute(
         "INSERT INTO insider_transactions (company_id, accession, row_no, filing_date, transaction_type, url) "
         "VALUES (?, 'X2', 0, ?, 'P', NULL)",
-        (a, "2026-01-01"),  # vecchio → NON conta come "recente"
+        (a, stale),  # vecchio → NON conta come "recente"
     )
     conn.commit()
 

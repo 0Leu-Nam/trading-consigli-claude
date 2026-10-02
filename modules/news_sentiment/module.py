@@ -36,6 +36,9 @@ def select_tickers(conn, universe: list[str], *, max_symbols: int, lookback_insi
                 seen.add(ticker)
                 ordered.append(ticker)
 
+    # ORDER BY esplicito: SQLite non garantisce l'ordine delle righe senza
+    # ORDER BY (dipende dal piano di query e dalle statistiche), quindi i ticker
+    # di pari priorità avrebbero un ordine arbitrario e instabile tra run.
     insider = [
         r["ticker"]
         for r in conn.execute(
@@ -44,6 +47,7 @@ def select_tickers(conn, universe: list[str], *, max_symbols: int, lookback_insi
             FROM insider_transactions t
             JOIN companies c ON c.id = t.company_id
             WHERE t.filing_date >= ?
+            ORDER BY c.ticker
             """,
             (cutoff,),
         )
@@ -54,6 +58,7 @@ def select_tickers(conn, universe: list[str], *, max_symbols: int, lookback_insi
         r["ticker"]
         for r in conn.execute(
             "SELECT c.ticker FROM watchlist w JOIN companies c ON c.id = w.company_id"
+            " ORDER BY c.ticker"
         )
     ]
     _append(watchlist)
