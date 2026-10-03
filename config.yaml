@@ -41,6 +41,27 @@ modules:
     core_name_matching: true  # 2° tier: match sui token del nome senza suffissi legali (es. "CHEVRON CORPORATION" → "CHEVRON CORP"); solo se univoco
     filer_cik_filter: ["0001541617", "0002045724", "0001263508"]    # CIK 10 cifre: Altimeter Capital, Situational Awareness LP, Baker Bros. Advisors — ESCLUSIVI: si raccolgono solo questi (filtro server EFTS, vedi README); vuoto = ordine EFTS, primi N
     fill_remaining_with_generic: false  # riempie gli slot liberi con altri filer: default false con whitelist attiva (i fileri estranei non richiesti è stato il bug del run #16); ignorato se filer_cik_filter è vuoto
+  scoring:
+    enabled: false           # FASE 6 — in osservazione locale prima dell'attivazione in produzione
+    recalc: false            # false = INSERT OR IGNORE (run ripetuti non riscrivono); true = ricalcola e sovrascrive gli score della stessa data
+    min_signals: 2           # moduli minimi distinti per entrare in shortlist: sotto questo è un punteggio da fonte singola
+    shortlist_size: 25
+    conflict_min_weight: 10  # etichetta 'segnali contrastanti' nella riga di sintesi quando un contributo positivo E uno negativo superano questo peso. NON cambia lo score: lo rende onesto. Caso reale CBRS: -20 insider sell e +50 institutional new = +35 pieno ma a meta'.
+    windows:                 # ogni modulo ha la sua finestra: il 13F è trimestrale con 45-90gg di lag, non ha senso paragonarlo a una finestra settimanale
+      insider:   {days: 7, min_value_usd: 50000, open_market_only: true}
+      price:     {days: 5, vol_spike_mult: 3.0, move_5d_pct: 0.10}
+      news:      {days: 14, positive_gte: 0.35, negative_lte: -0.35, min_articles: 3}
+      institutional: {quarters: 1, max_age_days: 120}
+    weights:                 # nessun peso è hardcoded: ogni regola ha il suo numero qui e la sua spiegazione nel README
+      insider_open_market_buy: 30    # P open-market sopra min_value_usd nella finestra
+      insider_open_market_sell: -20  # S open-market sopra soglia
+      price_volume_spike: 15         # vol_vs_avg_20 >= vol_spike_mult (spinta di acquisto, non direzione)
+      price_move_up: 10              # rendimento 5gg >= move_5d_pct, col segno: un ribasso non premia
+      news_sentiment_positive: 20    # media sentiment >= positive_gte su almeno min_articles articoli
+      news_sentiment_negative: -15   # media sentiment <= negative_lte su almeno min_articles articoli
+      institutional_new_position: 25 # posizione aperta nel trimestre da un gestore in filer_cik_filter
+      institutional_increase: 15     # posizione aumentata rispetto al trimestre precedente
+      institutional_multiple: 5      # piu' gestori whitelistati che aprono/aumentano la stessa posizione
 
 notifications:
   telegram:

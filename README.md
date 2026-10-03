@@ -13,8 +13,8 @@ Monitora periodicamente fonti dati pubbliche e produce una shortlist di "candida
 ## Struttura
 ```
 core/            contratto moduli, orchestratore, DB, config, reporting
-modules/         un modulo per fonte dati (insider, prezzi, news, 13F)
-scoring/         aggregazione segnali → shortlist
+modules/         un modulo per fonte dati (insider, prezzi, news, 13F, scoring)
+scoring/         aggregazione segnali → shortlist (logica dentro modules/scoring)
 dashboard/       generatore pagina statica (Fase 7)
 data/            database SQLite versionato nel repo
 tests/           pytest
@@ -120,3 +120,133 @@ risolve **31%** dei CUSIP. La parte non risolta è quasi sempre strutturale:
 
 Se un CUSIP ti interessa anche se è in una di queste categorie, l'override
 manuale qui sopra è la via prevista.
+
+## Scoring: come si calcola il punteggio (Fase 6)
+
+Il modulo `scoring` non raccoglie dati: legge le tabelle degli altri 4 moduli e
+combin i segnali in un punteggio per ticker, scritto in `signals`.
+
+### Dove finiscono i numeri
+
+Tutti i pesi e le finestre sono in `config.yaml`, sezione `modules.scoring`.
+Nessun numero è nel codice: cambiando un peso lanciando il run cambia lo score
+(e c'è un test che lo verifica).
+
+| peso | cosa lo genera | cosa NON significa |
+|---|---|---|
+| `insider_open_market_buy` +30 | `transaction_type = 'P'`, `is_open_market = 1`, sopra `min_value_usd` nella finestra | non è un giudizio sull'azienda: è un segnale sul fatto che qualcuno ha comprato per conto proprio |
+| `insider_open_market_sell` −20 | `transaction_type = 'S'` open-market sopra soglia | i tipi `M`, `F`, `A`, `C`, `D`, `G` non sono mappati: sono esercizi di opzioni, assegnazioni e donazioni, non convinzione |
+| `price_volume_spike` +15 | `vol_vs_avg_20 >= vol_spike_mult` | è **volume**, non direzione del prezzo: uno spike può essere su un rialzo o su un crollo |
+| `price_move_up` +10 | rendimento a 5 giorni `>= move_5d_pct`, col segno | la colonna `abs_return_5d` contiene il rendimento con segno (misurato: min −0.85, max +1.74). Un ribasso non genera contributo positivo: da solo, un −30% e un +30% hanno lo stesso valore assoluto e significati opposti |
+| `news_sentiment_positive` +20 | media del sentiment `>= positive_gte` su almeno `min_articles` articoli | `min_articles` serve perché il sentiment è rumore: 711 articoli su 1082 sono `neutral` e la media di un solo titolo (+1.0) è più estrema di una diffusa (+0.2) |
+| `news_sentiment_negative` −15 | media `>= negative_lte` con lo stesso minimo di articoli | |
+| `institutional_new_position` +25 | posizione aperta nel trimestre da un gestore in `filer_cik_filter` | il 13F ha 45–90 giorni di lag: conferma una convinzione passata, non anticipa un movimento |
+| `institutional_increase` +15 | azioni aumentate rispetto al trimestre precedente | una posizione chiusa non genera contributo: la sua assenza è rumore, non una decisione di vendita |
+| `institutional_multiple` +5 | due o più gestori whitelistati che aprono o aumentano la stessa posizione | |
+
+Il segnale istituzionale è calcolato qui e non letto da
+`institutional_holdings.shares_delta`: quella colonna è NULL su tutto il DB,
+perché il modulo 13F confronta con il trimestre precedente *dentro lo stesso
+run* e con `quarters_back: 2` il primo trimestre non trova un precedente.
+
+### Un modulo senza dati non è un punteggio negativo
+
+Misurato sul DB reale: **nessuna company ha tutti e 4 i segnali**, 122 ne
+hanno 2 e 15 ne hanno 3. L'assenza di dati è quindi il caso normale.
+
+Perciò un modulo che non parla **contribuisce 0 e non penalizza**. Ogni riga
+dichiara quanto ha contribuito:
+
+```
+MU   +45.0  score +45.0 da 3 contributi, copertura 1/4 (institutional_holdings)
+KLAC +35.0  score +35.0 da 2 contributi, copertura 2/4 (institutional_holdings,price_screener)
+```
+
+Uno score di 60 su 2 moduli non è confrontabile con uno di 60 su 4 senza
+leggere la copertura, ed è per questo che è scritta nella riga.
+
+`min_signals` (default 2) tiene fuori dalla shortlist i punteggi costruiti su
+una sola fonte. **La riga resta in tabella**: la shortlist è un filtro di
+lettura, non di scrittura.
+
+### Ogni finestra è dichiarata
+
+`windows` in config, per modulo: `insider` 7 giorni, `news` 14, `price` 5,
+`institutional` un trimestre con `max_age_days`. L'istituzionale è
+trimestrale: paragonarlo a una finestra settimanale premieria posizioni
+vecchie come se fossero notizie. Un 13F più vecchio di `max_age_days` non
+contribuisce e **non è un errore**: è il segnale che non c'è più.
+
+L'età del dato finisce nella description della riga, così in dashboard è
+visibile che quel segnale ha 45+ giorni.
+
+### Come è tracciabile
+
+Nessuna migrazione di schema: si riusa il vincolo
+`UNIQUE (company_id, module_key, signal_type, signal_date)` già presente.
+
+- **una riga per contributo**, con il suo peso e il perché:
+  `insider_open_market_buy`, `magnitude=30`,
+  `description="acquisto open-market 27.5M da 2 insider"`
+- **una riga di sintesi** per ticker: `module_key='scoring'`,
+  `signal_type='composite'`, `magnitude` = totale, `description` = riepilogo
+  dei contributi e della copertura.
+
+La dashboard (Fase 7) mostra il totale e i dettagli con due query, senza
+parsing di JSON e senza ricalcolare nulla.
+
+I contributi con lo stesso tipo sono aggregati in una riga (pesi sommati,
+descrizioni concatenate): altrimenti due gestori che aprono la stessa
+posizione avrebbero la stessa chiave e il secondo verrebbe scartato in
+silenzio.
+
+### Idempotenza
+
+`signal_date` è l'ultima barra presente in `price_snapshots`, **non**
+`date.today()`: un ricalcolo il giorno dopo sullo stesso dataset produce la
+stessa chiave e non scrive nulla. Con nuovi dati di prezzo la chiave cambia e
+nasce una riga nuova, come negli altri moduli.
+
+`INSERT OR IGNORE` di default (un run ripetuto non altera nulla). Con
+`recalc: true` la sovrascrittura diventa esplicita.
+
+### Errori
+
+Un extractor che solleva non ferma gli altri: gli altri moduli contribuiscono,
+l'errore resta in `errors[]` e il run viene classificato `warning`. Un'assenza
+di dati non genera errori. `note` riporta quanti ticker sono stati valutati,
+quanti in shortlist e quanti ignorati da watchlist.
+
+### Segnali contrastanti
+
+Se un ticker ha **contributi positivi e negativi entrambi sopra
+`conflict_min_weight`** (default 10), la riga di sintesi lo dichiara:
+
+```
+CBRS +35.0  score +35.0 da 3 contributi, copertura 2/4
+            (insider_trading,institutional_holdings);
+            segnali contrastanti: + institutional_new_position vs - insider_open_market_sell
+```
+
+Il caso reale: 36 insider in vendita open-market per 87.7M (`-20`) e una nuova
+posizione di Altimeter (`+25 +25`, piu' `+5` multi-gestore) totalizzano un
+`+35` che sembrava pieno. Metà dei contributi tirava dalla parte opposta e
+niente nel numero lo diceva.
+
+**Il punteggio non cambia e la vendita non è bloccata**: `insider_open_market_sell`
+resta un peso negativo normale da -20. Quello che cambia è che il conflitto è
+dichiarato dove si legge il risultato. La ragione è che uno `+35` costruito
+con due fonti d'accordo e uno `+35` costruito annullando un disaccordo non
+sono lo stesso segnale, e la loro somma numerica è identica.
+
+La soglia serve a non dichiarare conflitto il rumore: `institutional_multiple`
+da `+5` contro una vendita da `-20` non è un disaccordo fra due fonti, e senza
+soglia l'etichetta finirebbe su quasi tutti i ticker con più di due moduli.
+`note` riporta anche il conteggio dei ticker con conflitto, così è visibile
+prima di aprire le righe: nel run del 2026-10-03 erano 6 su 145, di cui 2 in
+shortlist (CBRS e CRWV).
+
+### watchlist
+
+I ticker con `status = 'ignore'` non ricevono punteggio e non compaiono in
+shortlist, anche con score alto. Il conteggio finisce in `note`.

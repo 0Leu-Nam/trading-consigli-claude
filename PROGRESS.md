@@ -1,14 +1,16 @@
 # PROGRESS.md — Registro di continuità tra sessioni
 
 ## Stato attuale
-- Fase in corso: 5 — institutional_holdings (13F trimestrale, SEC EDGAR)
-- Percentuale completamento fase: implementazione e test locali COMPLETI (140/140 verdi), modulo **attivato in produzione** (`enabled: true`, 2026-10-01) con whitelist di 3 gestori → resta l'osservazione dei run.
+- Fase in corso: 6 — scoring / aggregazione dei 4 moduli in un punteggio per ticker
+- Percentuale completamento fase: implementazione e test locali COMPLETI (190/190 verdi), modulo **disabilitato** (`enabled: false`) → resta l'osservazione locale prima del flip.
+- Fase 5: 100% — `institutional_holdings` **attivata in produzione** (`enabled: true`, 2026-10-01) con whitelist di 3 gestori.
 - Fase 4: 100% — `news_sentiment` **attivata in produzione** (`enabled: true`, 2026-09-30).
 - Fase 3: 100% — validata in produzione.
 - Fase 2: 100% — workflow Actions autonomo, osservazione conclusa.
 - Fase 1: 100%.
 
 ## Ultima sessione conclusa
+- **Sessione 2026-10-03 — Fase 6 implementata (scoring), produzione OFF**: il modulo non raccoglie dati, legge le 4 tabelle degli altri moduli e scrive in `signals` una riga per contributo piu' una di sintesi per ticker. 185/185 verdi. La scelta di base e' stata presa **misurando la copertura reale prima di progettare** (nessuna company ha tutti e 4 i segnali), da qui la regola "un modulo che non parla contribuisce 0 e non penalizza" con copertura `N/4` esplicita in ogni riga. 4 difetti trovati misurando (segno di `abs_return_5d`, `shares_delta` NULL, join prezzo per `symbol`, rumore del sentiment) e 1 fallimento silenzioso chiuso (contributi con la stessa chiave UNIQUE scartati in silenzio, 15 punti persi). Dettagli in "Fase 6".
 - **Sessione 2026-10-01 — flip Fase 5: `institutional_holdings` attivata in produzione** con whitelist di 3 gestori (Altimeter Capital, Situational Awareness LP, Baker Bros. Advisors) e budget ristretto. Tre parametri ritoccati oltre l'`enabled` perche' misurati, non ipotizzati: `lag_days` 45→60, `max_filings` 120→6, `max_filings_scan` 2000→200. `tests/test_config.py` aggiornato a 4 moduli attivi + test sui CIK del whitelist (140/140 verdi). Motivazione dei gestori e limite strutturale del 13F nelle sezioni "Gestori scelti" e "Il 13F conferma, non anticipa".
 - **Sessione 2026-09-30 — Fase 5 implementata (13F), produzione OFF**: modulo, schema v2, test e documentazione; `institutional_holdings.enabled: false`. Dettagli e verifiche nelle sezioni "Verifiche di Fase 5" e "Problemi riscontrati".
 - **Sessione 2026-09-30 — flip Fase 4 e chiusura Fase 2/3**: `news_sentiment.enabled: true`; `tests/test_config.py` aggiornato a 3 moduli attivi (81/81 verdi). Osservazione di chiusura: **6 run consecutivi dopo l'introduzione dello status `warning`, tutti `ok` senza errori parziali, oltre 6 giorni di funzionamento autonomo** del cron (cron stabile, nessun warning imprevisto, dati insider/prezzo in avanzamento).
@@ -62,6 +64,51 @@
   - `config.yaml` (sezione `institutional_holdings` con **`enabled: false`** + `filer_cik_filter`, `core_name_matching`, `cusip_ttl_days`, `max_filings_scan`)
   - `tests/test_db_schema.py` (schema v2 + migrazione da DB v1)
   - `README.md` (sezione "Come trovare il CIK di un gestore" + override manuale di un CUSIP non risolto)
+
+
+## Fase 6 - Scoring / aggregazione (in osservazione locale)
+
+Il modulo `scoring` **non raccoglie dati**: legge le tabelle degli altri 4 moduli e combina i segnali in un punteggio per ticker, scritto in `signals` con una riga per contributo piu' una riga di sintesi.
+
+- **Copertura reale misurata prima di progettare** (questa ha guidato tutte le scelte): **nessuna company ha tutti e 4 i segnali**, 122 ne hanno 2, 15 ne hanno 3. Per modulo: prezzo 500, insider 352, istituzionale 112 (solo i 3 gestori), news 75. L'assenza di un modulo e' quindi il caso normale, non l'eccezione.
+- **Un modulo senza dati contribuisce 0 e non penalizza**, e ogni riga dichiara `copertura N/4` e quali moduli hanno parlato. Il punteggio non e' normalizzato per moduli disponibili: uno score 60 su 2 moduli non e' confrontabile con uno 60 su 4, e la riga lo dice. `min_signals: 2` tiene fuori dalla shortlist i punteggi a fonte singola, ma la riga resta in tabella.
+- **Finestra propria per modulo** (`windows` in config): insider 7gg, news 14gg, prezzo 5gg, istituzionale un trimestre con `max_age_days`. Il 13F ha 45-90gg di lag strutturale, paragonarlo a una finestra settimanale premieria posizioni vecchie. Un 13F oltre `max_age_days` non contribuisce e **non e' un errore**.
+- **Nessun peso hardcoded**: 9 pesi in `config.yaml`, ciascuno documentato in README con cosa genera e cosa NON significa. C'e' un test che cambiando un peso in config cambia lo score.
+- **Tracciabilita' senza migrare lo schema**: si riusa il `UNIQUE (company_id, module_key, signal_type, signal_date)` gia' presente. `SCHEMA_VERSION` resta 2, nessun rischio con il DB di produzione.
+- **Idempotenza**: `signal_date` = ultima barra in `price_snapshots`, non `date.today()`, cosi' un ricalcolo sullo stesso dataset non scrive nulla. `INSERT OR IGNORE` di default, con `recalc: true` per sovrascrivere esplicitamente.
+
+### Quattro problemi trovati misurando, non leggendo il codice
+
+1. **`abs_return_5d` contiene il rendimento con segno** (min -0.85, max +1.74), non il suo valore assoluto. Filtrarlo con `ABS()` e premiare la soglia senza il segno faceva entrare 2500 barre su 500 simboli come "anomalia": un ribasso del 30% e un rialzo del 30% hanno lo stesso valore assoluto e significati opposti.
+2. **`shares_delta` e' NULL su tutto il DB**: il modulo 13F confronta col trimestre precedente *dentro lo stesso run*, e con `quarters_back: 2` il primo trimestre non trova un precedente. Il segnale "ingresso di un gestore" non esisteva come dato ed e' stato calcolato in SQL nello scoring (misurato: 24 aumenti e 17 posizioni nuove in Q2 vs Q1).
+3. **Il join prezzo non si puo' fare per `symbol`**: `price_snapshots` e' indicizzato su `symbol`, ma le societa' emerse solo dal Form 4 non sono nell'universo di prezzo (KOD, ADRX, CRBG hanno `vol_vs_avg_20` = None non per assenza di spike, ma per assenza di bar). Il join passa da `company_id`, l'unica chiave comune.
+4. **Il sentiment e' rumore**: 711 articoli neutral su 1082. La media di un solo titolo (+1.0) e' piu' estrema di una diffusa (+0.2), quindi `min_articles` tiene fuori il titolo singolo.
+
+### Fallimento silenzioso chiuso: contributi con la stessa chiave UNIQUE
+
+I contributi dello stesso tipo per lo stesso ticker condividono
+`(company_id, module_key, signal_type, signal_date)`: due gestori whitelistati che aprono la stessa posizione producevano **due scritture di cui la seconda scartata in silenzio** da `INSERT OR IGNORE`, con 15 punti persi senza traccia. Ora `_merge_contributions` aggrega per `(module_key, signal_type)`: pesi sommati, descrizioni concatenate. Coperto da un test: due aumenti diventano una riga da 30 con entrambe le description.
+
+### Segnali contrastanti dichiarati senza cambiare il punteggio
+
+Un `+35` costruito con due fonti d'accordo e un `+35` che annulla una vendita insider da `-20` con un ingresso istituzionale da `+50` sono lo stesso numero e segnali diversi. Il caso reale e' **CBRS** (2026-10-03): 36 insider in vendita open-market per 87.7M e una nuova posizione di Altimeter finivano in un `+35` pieno, senza che nulla dicesse che meta' dei contributi tirava dalla parte opposta.
+
+Decisione (2026-10-03): la vendita open-market **resta un peso negativo normale da -20**, non un blocco. E' stato aggiunto solo lo dichiarazione del conflitto: `conflict_min_weight: 10` in config, `segnali contrastanti: + <tipi positivi> vs - <tipi negativi>` in coda alla description della riga di sintesi, piu' il conteggio dei ticker con conflitto in `note`. Il punteggio, il ranking e l'ingresso in shortlist restano identici: e' informazione, non filtro (coperto da un test che verifica il punteggio e l'ordine).
+
+La soglia esiste perche' senza di lei `institutional_multiple` da `+5` contro una vendita da `-20` verrebbe dichiarato conflitto e l'etichetta finirebbe su quasi tutti i ticker con piu' di due moduli. Misurato sul DB reale: **6 ticker su 145** hanno segnali contrastanti (CBRS, CRWV in shortlist; LITE +10; ABEO, BLLN, BNTX a +0.0, dove il conflitto e' l'unica informazione utile della riga).
+
+Nota emersa dai test: un contributo `insider_open_market_sell` e uno `insider_open_market_buy` sulla stessa azienda nella stessa finestra sono casi reali e distinti, non una contraddizione della fonte. Il test helper nascondeva il secondo perche' il suo `accession` non includeva il tipo di transazione e `INSERT OR IGNORE` lo scartava: un test che credeva di avere due contributi ne aveva uno, in silenzio.
+
+- File creati in Fase 6:
+  - `modules/scoring/sources.py` (4 extractor a firma uniforme, tutti "restituiscono solo segnali esistenti": l'assenza non e' uno zero)
+  - `modules/scoring/module.py` (pesi da config, finestre per modulo, copertura esplicita, shortlist con tie-breaker deterministici, watchlist `ignore`, isolamento errori per sorgente e per ticker, `_merge_contributions`)
+  - `tests/test_scoring_module.py` (37 test)
+- File modificati in Fase 6:
+  - `config.yaml` (sezione `scoring` con **`enabled: false`**, `recalc`, `min_signals`, `shortlist_size`, `windows`, 9 pesi)
+  - `tests/test_config.py` (scoring presente ma disabilitato, pesi completi con almeno un negativo, finestre per tutti e 4 i moduli, `max_age_days` presente)
+  - `README.md` (sezione "Scoring: come si calcola il punteggio" con tabella pesi, copertura, idempotenza, tracciabilita')
+- Test: 190 (37 nuovi sullo scoring + 2 sui pesi in config)
+- **Stato: `enabled: false` in attesa di osservazione locale.** Verifica su DB temporaneo reale: 145 ticker valutati, 308 righe in `signals`, 11 in shortlist con `min_signals: 2`, 0 errori.
 
 ## Perché il 31% dei CUSIP non risolve (analisi misurata, campione 329 CUSIP da 8 filing)
 Smistamento dei 227 CUSIP non risolti, pesato sui CUSIP (non sui nomi: gli 92 nomi distinti contengono molte righe di ETF trust):
@@ -153,11 +200,12 @@ Il 13F-HR e' trimestrale con un ritardo di pubblicazione di **45 giorni dal term
 Uso corretto in Fase 6: incrociare 13F con insider trading, price screener e news sentiment per capire **quando** il mercato e' venuto a saperla e quanto del movimento e' gia' avvenuto, non chi l'aveva capito per primo. Come segnale a se' vale per la **qualita' e la persistenza** di un thesis (convinto e non ridimensiona), non per il timing. Se in futuro servisse il timing, la via non e' la 13F ma Form 4/13D-13G (eventi, non trimestrali), che pero' coprono solo soggetti oltre soglie di dimensione.
 
 ## Prossimo step esatto
-1. **Commit 1 (Fase 5, produzione OFF)** a cura dell'utente: `core/db.py`, `modules/institutional_holdings/*` (3 file), `tests/test_13f_*.py`, `tests/test_cusip_map.py`, `tests/test_institutional_module.py`, `tests/test_db_schema.py`, `README.md`, `PROGRESS.md`, `config.yaml`. Include il gate sull'evidenza del match "core" (7 CUSIP di ETF Global X finivano su SPGI prima del fix, vedi "Perche' il 31%").
-2. **Commit 2 (flip)**: `config.yaml`, `tests/test_config.py`, `PROGRESS.md`.
-3. Dopo il push, osservare i run del cron: `institutional_holdings` e `cusip_lookup` si popolano e `run_log` resta `ok`/`warning` (i CUSIP non risolti sono attesi e NON devono far fallire il run). Verificare che le tabelle degli altri moduli non hanno subito regressioni dalla migrazione a schema v2 (la migrazione e' stata provata su una copia di `data/app.db`: conteggi di `companies`, `insider_transactions`, `price_snapshots`, `news_events` invariati).
-4. **Procedura staged saltata di proposito**: la regola registrata in precedenza prevedeva `quarters_back: 1` + budget basso prima di impostare il whitelist. Non applicata perche' il rischio che mitigava (esplosione del volume di filing e rumore da fondi piccoli) e' gia' rimosso alla fonte: whitelist di 3 CIK verificati + budget 6 + scan 200 = 12 XML per run. Il whitelist da solo non basta, perche' e' una coda di priorita' e non un filtro esclusivo: e' il budget a rendere il run bounded.
-5. Primo dato utile atteso: i 13F del Q2 2026 dei 3 gestori, disponibili da subito. Il **Q3 2026** entra in finestra solo dopo il 2026-11-30 (con `lag_days: 60`).
+1. **Fase 6 resta OFF.** Prima di ogni flip, due osservazioni da fare da terminale su `data/app.db`, che e' l'unica fonte dei numeri sopra:
+   - leggere la shortlist con `copertura` e i **nomi dei moduli che hanno parlato**: se i primi 25 sono tutti `copertura 1/4` con un solo modulo forte, il problema non e' lo score ma la copertura, e va risolto prima di attivare (i candidati naturali sono `news_sentiment` e `price_screener`, che hanno solo 75 e 500 company);
+   - verificare che `institutional_new_position` non sia inflato da posizioni comparate con il trimestre sbagliato: se un titolo segnalato come "nuova posizione" ha gia' 13F dei trimestri precedenti, il `quarters_back` o il confronto vanno corretti.
+2. **Commit (a cura dell'utente)**: `config.yaml`, `modules/scoring/sources.py`, `modules/scoring/module.py`, `tests/test_scoring_module.py`, `tests/test_config.py`, `README.md`, `PROGRESS.md`.
+3. Flip di Fase 6 in un commit separato (`scoring.enabled: true`) **solo dopo** le due osservazioni del punto 1 su almeno un paio di run locali con dati freschi.
+4. La Fase 7 (dashboard) puo' partire prima del flip di Fase 6: la dashboard tabellare (7a) non dipende dallo score, e mostrare prima la tabella dei segnali grezzi rende visibile se lo score aggiunge o toglie valore.
 
 ## Limiti noti di Fase 5 (per le fasi successive)
 - Tasso di risoluzione CUSIP **31%** (misurato su 329 CUSIP di 8 filing reali, dopo il gate sull'evidenza: era 34% e comprende 9 match errati eliminati). Smistamento completo in "Perche' il 31% dei CUSIP non risolve": il 70% del residuo sono fondi/ETF **assenti dalla fonte EDGAR** (limite di fonte, non di algoritmo). Con i 3 gestori concentrati scelti la misura e' favorevole: molte posizioni sono società a nome singolo (`NVIDIA CORPORATION`, `APPLIED MATLS INC`) che risolvono bene, mentre le posizioni non risolte sono soprattutto ETF/fondi, marginali per il nostro uso. **Non** sono marginali le azioni con classi multiple (es. Alphabet GOOG/GOOGL), lasciate apposta non risolte per non attribuire la classe sbagliata.
@@ -166,3 +214,13 @@ Uso corretto in Fase 6: incrociare 13F con insider trading, price screener e new
 - La finestra di deposito è `[q_end+1, q_end+lag_days]`: i depositi in ritardo oltre il lag (rare, più tipici con `13F-HR/A` o ritardi dell'istruttore) vengono ignorati da soli; per recuperarli serve `quarters_back` più ampio o un allineamento del `filing_quarter` al `period_ending` reale (oggi scartati se fuori finestra).
 
 Nota per Fase 7 (da non dimenticare): dividere in 7a (dashboard tabellare pura) e 7b (aggiunta sezione discorsiva via template, non LLM, per non rompere la tabella già funzionante). Vedi conversazione Claude del 24/09 per dettaglio completo del prompt.
+
+## Limiti noti di Fase 6 (per le fasi successive)
+
+- **La copertura, non lo score, è il limite vero.** Misurato: 145 company hanno almeno un segnale, ma solo 11 arrivano a 2 moduli. La shortlist è quindi corta per costruzione, non per selettività. Se in futuro sembra "poco varia", la risposta è allargare la copertura (più fonti, non pesi diversi), non alzare `min_signals` o i pesi.
+- **I pesi non sono calibrati su performance**: sono scelte esplicite di priorità (convincenza privata > istituzionale > prezzo > notizie) dichiarate in config. Nessun peso è derivato da un backtest, perché non esiste un dataset etichettato di "cosa doveva succedere". Se in Fase 8 si vuole pesare sull'esito, il percorso è valutare i segnali contro il rendimento successivo, non continuare a modificare i pesi a sensazione.
+- **Il segnale istituzionale è trimestrale e con lag**: 45-90 giorni di ritardo strutturale, e la sua freschezza (`max_age_days`) è governata dal `filing_quarter` (fine trimestre), non dalla data di deposito. Un 13F appena depositato su un trimestre vecchio viene penalizzato per anzianità di trimestre. È la scelta documentata, ma va ricordata leggendo i numeri in dashboard.
+- **`institutional_multiple` premia la convergenza, non l'accordo**: due gestori che aprono la stessa posizione non sanno l'uno dell'altro (i 13F sono depositati in momenti diversi e non sono leggibili in tempo reale). Il bonus misura che il tema è condiviso, non una conferma incrociata.
+- **Le righe non hanno vita breve**: `INSERT OR IGNORE` per chiave `(company, tipo, data)` significa che la storia dello score si accumula e le righe passate non vengono ricalcolate. Se in futuro un peso cambia in config, le righe storiche restano con il peso vecchio: per un ricalcolo completo serve `recalc: true` sui dati di oggi, non un aggiornamento retroattivo.
+- **`min_signals` filtra la shortlist, non i dati**: un ticker con `copertura 1/4` ha comunque la sua riga in tabella e il suo score. Se la dashboard mostra "tutti i punteggi", la colonna `copertura` va mostrata sempre insieme, altrimenti la shortlist e la tabella si leggono come due liste incompatibili.
+- **Nota tecnica**: la riga di sintesi ha `signal_type='composite'` e `module_key='scoring'`. Se in futuro un modulo reale volesse produrre segnali di tipo `composite`, la UNIQUE li separerebbe comunque per `module_key`: la separazione regge senza migrazioni.
