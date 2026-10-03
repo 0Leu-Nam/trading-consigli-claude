@@ -42,12 +42,27 @@ ricava il ticker dal nome dell'emittente confrontandolo con la mappa EDGAR
 `filer_cik_filter` serve per dare la precedenza ai 13F dei gestori scelti
 invece di prendere i depositi più recenti.
 
-> **Attenzione: è una coda di priorità, non un filtro esclusivo.** I CIK in
-> lista vengono selezionati per primi, ma il budget `max_filings` viene
-> comunque riempito con altri filer. Per processare **solo** i gestori
-> indicati, il numero di CIK deve essere uguale o vicino a `max_filings`
-> (nella config attuale: 3 CIK con `max_filings: 6`, per lasciare margine
-> agli eventuali 13F-HR/A).
+> **La whitelist è esclusiva**: quando è valorizzata il modulo raccoglie
+> **solo** i 13F dei CIK indicati. I CIK vengono usati come **filtro della
+> ricerca EDGAR** (una richiesta per finestra di deposito), quindi i gestori
+> scelti vengono raccolti anche se in elenco EFTS non sono i primi.
+>
+> `max_filings` è un **tetto per trimestre**, non un obiettivo da riempire:
+> se i gestori in lista depositano meno documenti, gli slot restano liberi e
+> non viene contato nessun altro filer. Non serve quindi tenere
+> `max_filings` allineato alla lunghezza della whitelist.
+>
+> Per aggiungere volutamente altri filer, impostare
+> `fill_remaining_with_generic: true` (default `false`): gli slot residui si
+> riempiono con una ricerca generica e la nota del run dichiara
+> `filer generici=N`.
+>
+> Il modulo segnala come errore (run classificato **`warning`**) due casi in
+> cui un `ok` sarebbe un falso successo:
+> - la whitelist è valorizzata ma nessun CIK ha depositato un 13F-HR nelle
+>   finestre del run;
+> - il tetto `max_filings` ha scartato il 13F di un gestore in lista
+>   (un 13F-HR/A in più sullo stesso CIK invece è normale e non segnala).
 
 ### 1. Trovare il CIK
 - **EDGAR full-text search**: https://efts.sec.gov/LATEST/search-index?q=NOME&forms=13F-HR

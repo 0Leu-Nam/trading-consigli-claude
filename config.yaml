@@ -34,12 +34,13 @@ modules:
     enabled: true           # FASE 5 — 13F trimestrale (attivata in produzione il 2026-10-01)
     lag_days: 60            # ritardo pubblicazione 13F: processa solo trimestri chiusi da almeno 60gg (15gg di margine oltre il deadline SEC di 45gg)
     quarters_back: 2        # quanti trimestri chiusi per run (più recente prima)
-    max_filings: 6          # cap filing per trimestre: i 3 gestori in filer_cik_filter + margine per emendamenti (12 XML/run, non 240)
-    max_filings_scan: 200   # hit EFTS esaminate per trimestre: i gestori del whitelist stanno in cima (40 GET/run)
+    max_filings: 6          # TETTO per trimestre, non obiettivo da riempire: con la whitelist attiva gli slot in eccesso restano liberi. 6 lascia margine agli eventuali 13F-HR/A dei 3 gestori (12 XML/run, non 240)
+    max_filings_scan: 200   # hit EFTS esaminate per trimestre solo nel percorso generico; con filer_cik_filter la ricerca è già filtrata lato server (1 richiesta/finestra)
     skip_put_call: true     # scarta le posizioni su opzioni (putCall valorizzato)
     cusip_ttl_days: 60      # validità della cache cusip_lookup prima di ri-risolvere il nome
     core_name_matching: true  # 2° tier: match sui token del nome senza suffissi legali (es. "CHEVRON CORPORATION" → "CHEVRON CORP"); solo se univoco
-    filer_cik_filter: ["0001541617", "0002045724", "0001263508"]    # CIK 10 cifre: Altimeter Capital, Situational Awareness LP, Baker Bros. Advisors — in ordine di priorità (vedi README); vuoto = ordine EFTS
+    filer_cik_filter: ["0001541617", "0002045724", "0001263508"]    # CIK 10 cifre: Altimeter Capital, Situational Awareness LP, Baker Bros. Advisors — ESCLUSIVI: si raccolgono solo questi (filtro server EFTS, vedi README); vuoto = ordine EFTS, primi N
+    fill_remaining_with_generic: false  # riempie gli slot liberi con altri filer: default false con whitelist attiva (i fileri estranei non richiesti è stato il bug del run #16); ignorato se filer_cik_filter è vuoto
 
 notifications:
   telegram:

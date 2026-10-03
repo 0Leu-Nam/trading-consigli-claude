@@ -127,12 +127,23 @@ def clean_display_name(name: str) -> str:
 
 
 def search_13f(
-    user_agent: str, start_dt: str, end_dt: str, max_filings: int
+    user_agent: str,
+    start_dt: str,
+    end_dt: str,
+    max_filings: int,
+    ciks: list[str] | None = None,
 ) -> list[Filing13F]:
     """Cerca i 13F-HR depositati in [start_dt, end_dt] via full-text search.
 
     Le finestre sono quelle di DEPOSITO di un trimestre (q_end+1 .. q_end+45gg).
     Le hit EFTS sono documenti dentro i filing: si deduplica per accession.
+
+    ``ciks`` filtra lato server (parametro EFTS ``ciks``, separati da virgola):
+    serve a cercare gestori NOTI, perche' l'ordine di EFTS non e' quello del
+    deposito che si cerca — i gestori richiesti possono stare anche in fondo
+    alla coda (misurati: posizioni 1132/1857/2052 su ~4.000 accessions della
+    finestra Q2 2026) e il fallback "primi N" prenderebbe altri filer.
+    Con il filtro la richiesta e' una sola per finestra invece di N pagine.
     """
     discoveries: list[Filing13F] = []
     seen: set[str] = set()
@@ -146,6 +157,8 @@ def search_13f(
             "enddt": end_dt,
             "from": str(offset),
         }
+        if ciks:
+            params["ciks"] = ",".join(ciks)
         resp = _get(EFTS_SEARCH_URL + "?" + requests.compat.urlencode(params), user_agent)
         try:
             payload = resp.json()
@@ -177,8 +190,9 @@ def search_13f(
         if len(hits) < PAGE_SIZE:
             break
     logger.info(
-        "EFTS: %d depositi 13F-HR unici in %s..%s (%d pagine esaminate)",
+        "EFTS: %d depositi 13F-HR unici in %s..%s (%d pagine esaminate, ciks=%s)",
         len(discoveries), start_dt, end_dt, offset // PAGE_SIZE + 1,
+        ",".join(ciks) if ciks else "tutti",
     )
     return discoveries
 

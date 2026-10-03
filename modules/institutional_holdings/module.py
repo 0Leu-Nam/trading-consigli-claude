@@ -133,6 +133,10 @@ class Module(ModuleInterface):
             for cik in (ctx.get("filer_cik_filter") or [])
             if str(cik).strip()
         }
+        # Il fallback generico si puo' richiedere SOLO con la whitelist attiva:
+        # senza whitelist il modulo e' gia' generico ("primi N piu' recenti") e
+        # il flag non avrebbe significato.
+        fill_generic = bool(ctx.get("fill_remaining_with_generic", False)) if whitelist else False
 
         today = date.today()
         windows = target_quarters(today, lag_days, quarters_back)
@@ -148,16 +152,23 @@ class Module(ModuleInterface):
         errors: list[str] = []
         rows_written = 0
         found_total = processed = whitelist_used = 0
+        generics_total = 0
         skipped_put_call = skipped_no_shares = unresolved = 0
         skipped_not_shares = skipped_period = 0
 
         for window in windows:
+            # Con whitelist il filtro va messo lato RICERCA: l'ordine di EFTS non
+            # e' quello del deposito cercato e i gestori richiesti possono stare
+            # in fondo alla coda (misurati: ~1100-2100 su ~4000 accessions), quindi
+            # il solo "primi N" prenderebbe altri filer e produrrebbe holdings di
+            # gestori mai richiesti, senza alcun errore.
             try:
                 found = edgar_13f.search_13f(
                     user_agent,
                     window.deposit_start.isoformat(),
                     window.deposit_end.isoformat(),
                     max_filings_scan,
+                    ciks=sorted(whitelist) or None,
                 )
             except edgar_13f.SecEdgarError as exc:
                 return ModuleResult(
@@ -165,8 +176,52 @@ class Module(ModuleInterface):
                     errors=[f"13F {window.quarter}: ricerca EFTS fallita: {exc}"],
                 )
             found_total += len(found)
-            selected, in_wl = select_filings(found, max_filings, whitelist)
+            generic_used = 0
+            covered_ciks: set[str] = set()
+            if whitelist:
+                # Difensivo: il filtro lato ricerca dovrebbe gia' restituire
+                # solo i CIK richiesti, ma non ci si fida ciecamente del
+                # risultato di una ricerca remota per decidere quali filer
+                # scrivere nel DB. Il filtro client e' la garanzia.
+                selected = [f for f in found if f.ciks and f.ciks[0] in whitelist][:max_filings]
+                in_wl = len(selected)
+                covered_ciks.update(f.ciks[0] for f in selected if f.ciks)
+
+                # Fallback generico solo su richiesta esplicita: la whitelist e'
+                # esclusiva, quindi non si riempiono slot residui con filer
+                # estranei di propria iniziativa (era la causa dei dati del run #16).
+                if fill_generic and len(selected) < max_filings:
+                    try:
+                        extra = edgar_13f.search_13f(
+                            user_agent,
+                            window.deposit_start.isoformat(),
+                            window.deposit_end.isoformat(),
+                            max_filings_scan,
+                        )
+                    except edgar_13f.SecEdgarError as exc:
+                        errors.append(f"13F {window.quarter}: ricerca EFTS generica fallita: {exc}")
+                        extra = []
+                    selected += [
+                        f for f in extra
+                        if not (f.ciks and f.ciks[0] in whitelist)
+                    ][: max_filings - len(selected)]
+                    generic_used = len(selected) - in_wl
+
+                # Cap che esaurisce il budget: se un CIK richiesto e' stato
+                # trovato ma non processato, il suo 13F e' perso per quel
+                # trimestre senza che nulla lo segnali. Un emendamento in piu'
+                # sullo stesso CIK gia' coperto invece e' normale.
+                for cik in sorted(whitelist - covered_ciks):
+                    if any(f.ciks and f.ciks[0] == cik for f in found):
+                        errors.append(
+                            f"filer_cik_filter: CIK {cik} trovato nelle finestre ma non "
+                            f"processato per il tetto max_filings={max_filings} in "
+                            f"{window.quarter}: le sue posizioni non sono state raccolte"
+                        )
+            else:
+                selected, in_wl = select_filings(found, max_filings, whitelist)
             whitelist_used += in_wl
+            generics_total += generic_used
 
             for filing in selected:
                 processed += 1
@@ -249,10 +304,30 @@ class Module(ModuleInterface):
                     )
                     rows_written += cur.rowcount
 
+        # Fallback silenzioso: whitelist configurata ma nessun filing dei gestori
+        # richiesti trovato nelle finestre. Non e' un errore tecnico (il run va
+        # avanti), ma il risultato NON e' quello atteso e deve restare visibile:
+        # un 'ok' con 0 match di whitelist maschererebbe il fatto che i 13F dei
+        # gestori scelti non sono stati presi.
+        if whitelist and whitelist_used == 0:
+            errors.append(
+                f"filer_cik_filter: nessuno dei {len(whitelist)} CIK configurati ha depositato "
+                f"un 13F-HR nelle finestre "
+                f"{','.join(f'{w.quarter}[{w.deposit_start}..{w.deposit_end}]' for w in windows)}: "
+                f"holdings dei gestori richiesti non raccolti. CIK cercati: {', '.join(sorted(whitelist))}"
+            )
+
         note = (
             f"trimestri={','.join(w.quarter for w in windows)}; "
-            f"depositi visti={found_total}, filing esaminati={processed} "
-            f"(whitelist={whitelist_used}); opzioni scartate={skipped_put_call}, "
+            f"depositi visti={found_total}, filing esaminati={processed}, "
+            f"filer generici={generics_total}"
+            + (
+                f", cik_whitelist={whitelist_used}/{len(whitelist)}"
+                if whitelist
+                else " (nessuna whitelist: ordine EFTS)"
+            )
+            + "; "
+            f"opzioni scartate={skipped_put_call}, "
             f"non-SH scartate={skipped_not_shares}, senza quote={skipped_no_shares}, "
             f"periodo fuori finestra={skipped_period}, cusip non risolti={unresolved}; "
             f"value grezzo del filer (unità non normalizzata)"

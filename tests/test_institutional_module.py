@@ -194,8 +194,266 @@ def test_whitelist_filer_is_processed_before_others(ctx_and_conn, monkeypatch):
     conn.commit()
     filer = conn.execute("SELECT DISTINCT filer_cik FROM institutional_holdings").fetchone()
     assert filer["filer_cik"] == "0000000123"
-    assert "whitelist=1" in result.note
+    assert "cik_whitelist=1/1" in result.note
     assert result.rows_written == 2  # budget 1 filing → 2 titoli risolti
+
+
+# ── il filtro della whitelist va messo lato RICERCA (bug del run #16) ─────────
+# L'ordine di EFTS non e' quello del deposito cercato: i gestori richiesti
+# stavano alle posizioni 1132/1857/2052 su ~4000 accessions della finestra Q2,
+# quindi la scansione limitata non li vedeva mai e il modulo scriveva le
+# posizioni di fund mai richiesti, con status 'ok' e nessun errore.
+
+def test_whitelist_ciks_are_passed_to_the_search(ctx_and_conn, monkeypatch):
+    """Il CIK deve arrivare a EFTS: altrimenti il modulo legge il primo N e ignora
+    la whitelist (confermato dal run #16 in produzione)."""
+    ctx, _conn, _path = ctx_and_conn
+    ctx.module_config["filer_cik_filter"] = ["0000000123", "0000000456"]
+    seen: list[list[str]] = []
+
+    def _capture(ua, start, end, cap, ciks=None):
+        seen.append(list(ciks or []))
+        return []
+
+    monkeypatch.setattr(edgar_13f, "search_13f", _capture)
+    monkeypatch.setattr(edgar_13f, "discover_information_table", lambda *a, **k: "https://x/info.xml")
+    Module().run(ctx)
+    assert seen, "nessuna finestra processata"
+    assert all(c == ["0000000123", "0000000456"] for c in seen), seen
+
+
+def test_no_ciks_param_when_whitelist_is_empty(ctx_and_conn, monkeypatch):
+    """Senza whitelist il percorso resta quello generico 'primi N più recenti'."""
+    ctx, _conn, _path = ctx_and_conn
+    ctx.module_config["filer_cik_filter"] = []
+    seen: list = []
+
+    def _capture(ua, start, end, cap, ciks=None):
+        seen.append(ciks)
+        return []
+
+    monkeypatch.setattr(edgar_13f, "search_13f", _capture)
+    Module().run(ctx)
+    assert seen and all(c is None for c in seen)
+
+
+def test_filers_outside_whitelist_are_never_written(ctx_and_conn, monkeypatch):
+    """Regressione diretta del run #16: la ricerca (o un suo mock) può restituire
+    filer fuori whitelist; il modulo non deve scriverne le posizioni."""
+    ctx, conn, _path = ctx_and_conn
+    others = [
+        _filing(accession="0000000009-26-000009", filer_cik="0000000009", name="NWM ADVISORS, LLC"),
+        _filing(accession="0000000010-26-000010", filer_cik="0000000010", name="KRANE FINANCIAL"),
+    ]
+    wanted = _filing(accession="0000000123-26-000123", filer_cik="0000000123", name="WANTED FUND")
+    # la ricerca restituisce TUTTI (comportamento del vecchio EFTS non filtrato)
+    _mock_all(monkeypatch, filings=others + [wanted])
+    ctx.module_config["filer_cik_filter"] = ["0000000123"]
+    ctx.module_config["max_filings"] = 10
+
+    result = Module().run(ctx)
+    conn.commit()
+    filers = {r["filer_cik"] for r in conn.execute("SELECT DISTINCT filer_cik FROM institutional_holdings")}
+    assert filers == {"0000000123"}, f"filer scritti fuori whitelist: {filers}"
+    assert "NWM ADVISORS, LLC" not in {r["filer_name"] for r in conn.execute("SELECT filer_name FROM institutional_holdings")}
+    assert result.status == "ok"
+
+
+def test_whitelist_configured_but_nothing_found_raises_warning(ctx_and_conn, monkeypatch):
+    """Whitelist configurata e zero CIK trovati: il run non puo' restare un 'ok'
+    silenzioso, altrimenti si crede di avere i 13F dei gestori scelti."""
+    ctx, conn, _path = ctx_and_conn
+    _mock_all(monkeypatch, filings=[])          # ricerca che non trova nulla
+    ctx.module_config["filer_cik_filter"] = ["0000000123", "0000000456"]
+
+    result = Module().run(ctx)
+    conn.commit()
+    assert result.rows_written == 0
+    assert result.errors, "nessun errore: il fallback silenzioso resta invisibile"
+    assert "0000000123" in result.errors[0] and "0000000456" in result.errors[0]
+    # il modulo resta 'ok' (non e' un fallimento tecnico) ma classify_run
+    # deve classificare il run come 'warning'
+    assert result.status == "ok"
+    from core.orchestrator import classify_run
+    assert classify_run([result], {"run": {"partial_error_threshold": 0}}) == "warning"
+
+
+def test_partial_whitelist_hit_is_not_an_error(ctx_and_conn, monkeypatch):
+    """Uno solo dei due gestori trovati è normale (l'altro può non aver depositato):
+    non deve generare warning."""
+    ctx, _conn, _path = ctx_and_conn
+    found = _filing(accession="0000000123-26-000123", filer_cik="0000000123", name="WANTED FUND")
+    _mock_all(monkeypatch, filings=[found])
+    ctx.module_config["filer_cik_filter"] = ["0000000123", "0000000456"]
+
+    result = Module().run(ctx)
+    assert result.errors == []
+    from core.orchestrator import classify_run
+    assert classify_run([result], {"run": {"partial_error_threshold": 0}}) == "ok"
+    assert "cik_whitelist=1/2" in result.note
+
+
+def test_whitelist_with_fewer_matches_than_max_filings_never_adds_outsiders(tmp_path, monkeypatch):
+    """Requisito strutturale: quando la whitelist è attiva i match sono MENO di
+    max_filings, quindi ci sono slot liberi. Nonostante isso, per QUALUNQUE valore
+    di max_filings non deve mai entrare un filer fuori whitelist: gli slot vuoti
+    restano vuoti. Il parametro non viene più derivato dalla lunghezza della
+    whitelist, quindi non deve poterla corrompere."""
+    for max_filings in (1, 2, 3, 5, 6, 10, 120):
+        # un DB pulito per ogni valore: il modulo riusa le righe di un run precedente
+        # e falserebbe l'asserzione sui filer scritti
+        path = tmp_path / f"app_{max_filings}.db"
+        db.init_schema(path)
+        conn = db.connect(path)
+        ctx = RunContext(conn=conn, module_config=dict(DEFAULT_CONFIG), global_config={},
+                         env_getter=lambda k, d=None: d)
+        others = [
+            _filing(accession="0000000009-26-000009", filer_cik="0000000009", name="NWM ADVISORS, LLC"),
+            _filing(accession="0000000010-26-000010", filer_cik="0000000010", name="KRANE FINANCIAL"),
+        ]
+        wanted = _filing(accession="0000000123-26-000123", filer_cik="0000000123", name="WANTED FUND")
+        # la ricerca "filtrata" restituisce anche estranei: il modulo deve comunque
+        # tenere la whitelist esclusiva, per qualsiasi max_filings
+        _mock_all(monkeypatch, filings=others + [wanted])
+        ctx.module_config["filer_cik_filter"] = ["0000000123"]
+        ctx.module_config["max_filings"] = max_filings
+
+        result = Module().run(ctx)
+        conn.commit()
+
+        filers = {
+            r["filer_cik"]
+            for r in conn.execute("SELECT DISTINCT filer_cik FROM institutional_holdings")
+        }
+        assert filers == {"0000000123"}, (
+            f"max_filings={max_filings}: filer scritti fuori whitelist: {filers}"
+        )
+        names = {
+            r["filer_name"]
+            for r in conn.execute("SELECT filer_name FROM institutional_holdings")
+        }
+        assert "NWM ADVISORS, LLC" not in names and "KRANE FINANCIAL" not in names, (
+            f"max_filings={max_filings}: fund estranei scritti: {names}"
+        )
+        assert result.rows_written > 0, f"max_filings={max_filings}: nulla scritto"
+        conn.close()
+
+
+def test_generic_search_is_not_called_by_default(ctx_and_conn, monkeypatch):
+    """Il fallback generico è opt-in: di default la whitelist esclusiva non deve
+    mai far partire una ricerca EFTS senza il parametro `ciks`."""
+    ctx, _conn, _path = ctx_and_conn
+    seen: list = []
+
+    def _capture(ua, start, end, cap, ciks=None):
+        seen.append(ciks)
+        return [_filing(accession="0000000123-26-000123", filer_cik="0000000123", name="WANTED FUND")]
+
+    monkeypatch.setattr(edgar_13f, "search_13f", _capture)
+    ctx.module_config["filer_cik_filter"] = ["0000000123"]
+    ctx.module_config["max_filings"] = 6
+    ctx.module_config.pop("fill_remaining_with_generic", None)
+
+    Module().run(ctx)
+    assert seen, "nessuna finestra processata"
+    assert all(c == ["0000000123"] for c in seen), f"ricerca generica non richiesta: {seen}"
+
+
+def test_fill_remaining_with_generic_adds_outsiders_on_request(ctx_and_conn, monkeypatch):
+    """Se il fallback è richiesto esplicitamente, gli slot residui si riempiono
+    con filer generici e la nota dichiara il numero, così non è invisibile."""
+    ctx, conn, _path = ctx_and_conn
+    calls: list = []
+    wanted = _filing(accession="0000000123-26-000123", filer_cik="0000000123", name="WANTED FUND")
+    outsider = _filing(accession="0000000010-26-000010", filer_cik="0000000010", name="KRANE FINANCIAL")
+
+    def _search(ua, start, end, cap, ciks=None):
+        calls.append(ciks)
+        if ciks:                      # ricerca filtrata: solo il gestore scelto
+            return [wanted]
+        return [outsider, wanted]     # ricerca generica: c'è anche un estraneo
+
+    _mock_all(monkeypatch, filings=[])          #Discovery, _get e CUSIP già mockati
+    monkeypatch.setattr(edgar_13f, "search_13f", _search)
+    ctx.module_config["filer_cik_filter"] = ["0000000123"]
+    ctx.module_config["max_filings"] = 6
+    ctx.module_config["fill_remaining_with_generic"] = True
+
+    result = Module().run(ctx)
+    conn.commit()
+
+    assert None in calls, "il fallback richiesto non ha mai cercato in modo generico"
+    names = {
+        r["filer_name"]
+        for r in conn.execute("SELECT filer_name FROM institutional_holdings")
+    }
+    assert "KRANE FINANCIAL" in names, "il fallback esplicito non ha riempito lo slot"
+    assert "filer generici=1" in result.note, result.note
+
+
+def test_fill_remaining_with_generic_ignored_without_whitelist(ctx_and_conn, monkeypatch):
+    """Senza whitelist il modulo è già generico: il flag non deve cambiare nulla."""
+    ctx, _conn, _path = ctx_and_conn
+    seen: list = []
+
+    def _capture(ua, start, end, cap, ciks=None):
+        seen.append(ciks)
+        return []
+
+    monkeypatch.setattr(edgar_13f, "search_13f", _capture)
+    ctx.module_config["filer_cik_filter"] = []
+    ctx.module_config["fill_remaining_with_generic"] = True
+
+    result = Module().run(ctx)
+    assert seen and all(c is None for c in seen), seen
+    assert result.errors == []
+
+
+def test_cap_dropping_a_whitelisted_filer_is_reported(ctx_and_conn, monkeypatch):
+    """Il cap può esaurire il budget e far perdere il 13F di un gestore richiesto:
+    è il secondo fallizio silenzioso (diverso dai filer estranei del run #16).
+    Se il CIK è stato trovato ma non processato, va segnalato."""
+    ctx, _conn, _path = ctx_and_conn
+    filings = [
+        _filing(accession="0000000123-26-000123", filer_cik="0000000123", name="WANTED FUND"),
+        _filing(accession="0000000456-26-000456", filer_cik="0000000456", name="OTHER FUND"),
+    ]
+    _mock_all(monkeypatch, filings=filings)
+    ctx.module_config["filer_cik_filter"] = ["0000000123", "0000000456"]
+    ctx.module_config["max_filings"] = 1
+
+    result = Module().run(ctx)
+    assert result.errors, "cap che scarta un gestore whitelistato: nessun errore"
+    assert any("0000000456" in err and "max_filings=1" in err for err in result.errors), result.errors
+    from core.orchestrator import classify_run
+    assert classify_run([result], {"run": {"partial_error_threshold": 0}}) == "warning"
+
+
+def test_cap_dropping_only_an_amendment_is_not_an_error(ctx_and_conn, monkeypatch):
+    """Se il CIK resta coperto da un altro suo filing, il cap non ha perso nulla
+    di richiesto: un 13F-HR/A in più è normale e non deve generare warning."""
+    ctx, _conn, _path = ctx_and_conn
+    filings = [
+        _filing(accession="0000000123-26-000123", filer_cik="0000000123", name="WANTED FUND"),
+        _filing(accession="0000000123-26-000124", filer_cik="0000000123", name="WANTED FUND"),
+    ]
+    _mock_all(monkeypatch, filings=filings)
+    ctx.module_config["filer_cik_filter"] = ["0000000123"]
+    ctx.module_config["max_filings"] = 1
+
+    result = Module().run(ctx)
+    assert result.errors == [], result.errors
+    from core.orchestrator import classify_run
+    assert classify_run([result], {"run": {"partial_error_threshold": 0}}) == "ok"
+
+
+def test_empty_result_without_whitelist_is_not_an_error(ctx_and_conn, monkeypatch):
+    """Senza whitelist non c'è nulla da segnalare: è il caso normale."""
+    ctx, _conn, _path = ctx_and_conn
+    _mock_all(monkeypatch, filings=[])
+    ctx.module_config["filer_cik_filter"] = []
+    result = Module().run(ctx)
+    assert result.errors == []
 
 
 def test_shares_delta_is_computed_against_previous_quarter(ctx_and_conn, monkeypatch):
