@@ -182,7 +182,15 @@ def test_search_failure_is_a_hard_error(ctx_and_conn, monkeypatch):
     assert "ricerca EFTS fallita" in result.errors[0]
 
 
-def test_whitelist_filer_is_processed_before_others(ctx_and_conn, monkeypatch):
+def test_whitelisted_filer_takes_the_slot_over_an_earlier_efts_hit(ctx_and_conn, monkeypatch):
+    """Whitelist esclusiva con budget esaurito: il CIK in lista prende l'unico slot
+    anche se EFTS l'ha restituito DOPI un filer estraneo, che viene scartato.
+
+    Un tempo questo test verificava una coda di priorita' ("whitelist first, poi
+    gli altri se restano slot"). Quella logica non esiste piu': con whitelist
+    attiva gli estranei non entrano affatto, quindi il confronto diretto con
+    l'ordine di EFTS non ha senso. Resta pero' il caso peggiore da coprire,
+    cioe' il tetto che potrebbe far vincere l'estraneo perche' arriva prima."""
     ctx, conn, _path = ctx_and_conn
     other = _filing(accession="0000000009-26-000009", filer_cik="0000000009", name="OTHER FUND")
     wanted = _filing(accession="0000000123-26-000123", filer_cik="0000000123", name="WANTED FUND")
@@ -195,6 +203,7 @@ def test_whitelist_filer_is_processed_before_others(ctx_and_conn, monkeypatch):
     filer = conn.execute("SELECT DISTINCT filer_cik FROM institutional_holdings").fetchone()
     assert filer["filer_cik"] == "0000000123"
     assert "cik_whitelist=1/1" in result.note
+    assert result.errors == []
     assert result.rows_written == 2  # budget 1 filing → 2 titoli risolti
 
 
