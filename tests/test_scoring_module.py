@@ -15,7 +15,7 @@ from core import db
 from core.module_interface import RunContext
 from core.orchestrator import classify_run
 from modules.scoring import sources
-from modules.scoring.module import Module
+from modules.scoring.module import SINGLE_SOURCE_LABEL, Module
 
 WEIGHTS = {
     "insider_open_market_buy": 30,
@@ -37,10 +37,12 @@ WINDOWS = {
 # Gli stessi numeri di config.yaml: senza questi la scala insider non avrebbe
 # bande e il contributo cadrebbe sul fallback default del modulo.
 INSIDER_SCALE = {
-    "frac_buy": [{"gte": 0.50, "mult": 1.6}, {"gte": 0.20, "mult": 1.3},
+    "frac_buy": [{"lt": 0.01, "mult": 0.15},
+                 {"gte": 0.50, "mult": 1.6}, {"gte": 0.20, "mult": 1.3},
                  {"gte": 0.05, "mult": 1.0}, {"gte": 0.0, "mult": 0.7}],
-    "frac_sell": [{"gte": 0.50, "mult": 1.6}, {"gte": 0.20, "mult": 1.3},
-                  {"gte": 0.05, "mult": 1.0}, {"gte": 0.0, "mult": 0.7}],
+    "frac_sell": [{"lt": 0.01, "mult": 0.15},
+                   {"gte": 0.50, "mult": 1.6}, {"gte": 0.20, "mult": 1.3},
+                   {"gte": 0.05, "mult": 1.0}, {"gte": 0.0, "mult": 0.7}],
     "by_insider_count": [{"gte": 4, "mult": 1.35}, {"gte": 2, "mult": 1.15}, {"gte": 1, "mult": 1.0}],
     "usd_fallback": {
         "buy": [{"gte_usd": 50_000_000, "mult": 1.40}, {"gte_usd": 10_000_000, "mult": 1.13},
@@ -50,12 +52,14 @@ INSIDER_SCALE = {
                  {"gte_usd": 1_000_000, "mult": 0.90}, {"gte_usd": 250_000, "mult": 0.65},
                  {"gte_usd": 0, "mult": 0.35}],
     },
-    "max_abs": 45,
+    "max_abs": 60,
 }
 DEFAULT_CONFIG = {
     "enabled": False,
     "recalc": False,
     "min_signals": 2,
+    "single_source_min": 40,
+    "single_source_limit": 10,
     "shortlist_size": 25,
     "warn_institutional_age_days": 150,
     "windows": WINDOWS,
@@ -506,20 +510,127 @@ def test_watch_status_is_not_ignored(ctx_and_conn):
 # ── 7. min_signals ────────────────────────────────────────────────────────────
 
 
-def test_min_signals_excludes_single_source_from_shortlist_but_keeps_row(ctx_and_conn):
+def test_min_signals_splits_shortlist_in_two_sections_but_keeps_row(ctx_and_conn):
+    """`min_signals` non e' piu' un filtro, e' un confine fra due sezioni.
+
+    Entrambi i ticker hanno la riga: la shortlist e' un filtro di lettura, non di
+    scrittura. SOLO (un modulo) va nella sezione fonte singola, DOPPIO (due
+    moduli) in quella multipla, e la riga di SOLO porta l'etichetta che la Fase 7
+    usa per separarle con una query.
+    """
     ctx, conn, _path = ctx_and_conn
     solo = add_company(conn, "SOLO")
-    add_insider(conn, solo)
+    add_insider(conn, solo, shares=1000, holdings_after=1000)      # +48, copertura 1/4
     doppio = add_company(conn, "DOPPIO")
-    add_insider(conn, doppio)
-    add_news(conn, doppio, [0.9, 0.9, 0.9])
+    add_insider(conn, doppio, shares=1000, holdings_after=1000)    # +48
+    add_news(conn, doppio, [0.9, 0.9, 0.9])                       # +20 -> 68, 2/4
 
-    Module().run(ctx)
+    result = Module().run(ctx)
     # entrambi hanno la riga: la shortlist e' un filtro di lettura, non di scrittura
     assert composite(conn, "SOLO") is not None
     assert composite(conn, "DOPPIO") is not None
     assert "copertura 1/4" in composite(conn, "SOLO")["description"]
     assert "copertura 2/4" in composite(conn, "DOPPIO")["description"]
+
+    desc_solo = composite(conn, "SOLO")["description"]
+    assert SINGLE_SOURCE_LABEL in desc_solo, (
+        "il fonte singola deve dichiararlo nella riga, non solo nella note"
+    )
+    assert SINGLE_SOURCE_LABEL not in composite(conn, "DOPPIO")["description"], (
+        "un segnale confermato da due fonti non puo' portare l'etichetta del non confermato"
+    )
+    assert "in shortlist multipla=1" in result.note
+    assert "in shortlist fonte singola=1" in result.note
+
+
+def test_single_source_min_from_config_decides_section_two(ctx_and_conn):
+    """La soglia arriva dalla config, non da una costante.
+
+    Con `single_source_min` a 40 il SOLO da +30 resta fuori da ogni sezione:
+    non e' rumore, ma non e' neppure un segnale forte, e promuoverlo a shortlist
+    riempirebbe la lista di casi marginali. Alzando la soglia a 20 rientra, e
+    questo dimostra che il filtro e' quello dichiarato e non altro.
+
+    Sotto la soglia l'etichetta NON c'e' nemmeno: sotto `single_source_min` il
+    ticker non e' un candidato della sezione 2, e scrivere "fonte singola" su una
+    riga che nessuno listino' direbbe il vero a meta'. Resta invece etichettato
+    se e' forte ma tagliato dal tetto di lista, perche' li' il segnale c'e'.
+    """
+    ctx, conn, _path = ctx_and_conn
+    solo = add_company(conn, "SOLO")
+    add_insider(conn, solo)                       # +30, copertura 1/4
+    # Il secondo run cambia solo la soglia, non i dati: senza `recalc` la riga
+    # scritta dal primo resterebbe quella vecchia (INSERT OR IGNORE) e il test
+    # leggerebbe una description che nessuno codice ha più prodotto.
+    ctx.module_config["recalc"] = True
+
+    result = Module().run(ctx)
+    assert "in shortlist fonte singola=0" in result.note
+    assert SINGLE_SOURCE_LABEL not in composite(conn, "SOLO")["description"], (
+        "sotto single_source_min non e' un candidato della sezione 2: etichettarlo "
+        "qui direbbe il vero a meta'"
+    )
+
+    ctx.module_config["single_source_min"] = 20
+    result = Module().run(ctx)
+    assert "in shortlist fonte singola=1" in result.note
+    assert "SOLO=+30" in result.note
+    assert SINGLE_SOURCE_LABEL in composite(conn, "SOLO")["description"]
+
+
+def test_single_source_limit_caps_section_two(ctx_and_conn):
+    """Il tetto della sezione 2 vale solo per lei.
+
+    Tre fonti singole forti e una multipla: la multipla deve restare in shortlist
+    per intero, e le singole essere troncate al limite dichiarato. Se il tetto
+    fosse applicato alla lista unica, un segnale confermato verrebbe escluso da
+    un segnale non confermato piu' rumoreoso.
+    """
+    ctx, conn, _path = ctx_and_conn
+    for i in range(3):
+        add_insider(conn, add_company(conn, f"S{i}"), shares=1000, holdings_after=1000)  # +48
+    multi = add_company(conn, "MULTI")
+    add_insider(conn, multi)
+    add_news(conn, multi, [0.9, 0.9, 0.9])
+
+    ctx.module_config["single_source_limit"] = 1
+    result = Module().run(ctx)
+
+    assert "in shortlist multipla=1" in result.note
+    assert "in shortlist fonte singola=1" in result.note
+    assert "top multipla: MULTI=+50" in result.note
+    # a parita' di score vince il ticker in ordine alfabetico: resta S0
+    assert "top fonte singola: S0=" in result.note
+
+
+def test_shortlist_sections_are_not_merged_into_one_ranking(ctx_and_conn):
+    """Un +55 a fonte singola non e' piu' "convincente" di un +35 a due moduli.
+
+    Le due sezioni restano due elenchi: se venissero accostate in un ranking
+    unico, il segnale non confermato finirebbe davanti a quello confermato e il
+    lettore prenderebbe per forte il dato piu' fragile del run.
+    """
+    ctx, conn, _path = ctx_and_conn
+    # fonte singola forte: 30 x 1.6 (quota 100%) = 48
+    forte = add_company(conn, "FORTE")
+    add_insider(conn, forte, shares=1000, holdings_after=1000)
+    # multipla PIU' DEBOLE: +4.5 (quota 0.47%, sotto la soglia trascurabile) + 20 news
+    debole = add_company(conn, "DEBOLE")
+    add_insider(conn, debole, shares=47, holdings_after=10_000)
+    add_news(conn, debole, [0.9, 0.9, 0.9])
+
+    result = Module().run(ctx)
+
+    assert composite(conn, "FORTE")["magnitude"] == pytest.approx(48.0)
+    assert composite(conn, "DEBOLE")["magnitude"] == pytest.approx(24.5)
+    # 48 > 24.5: il fonte singola pesa di piu', e non sale lo stesso per questo
+    assert "top multipla: DEBOLE=" in result.note
+    assert "top fonte singola: FORTE=" in result.note
+    # la copertura del singola resta quella dichiarata: non viene promosso
+    assert "copertura 1/4" in composite(conn, "FORTE")["description"]
+    assert "copertura 2/4" in composite(conn, "DEBOLE")["description"]
+    assert SINGLE_SOURCE_LABEL in composite(conn, "FORTE")["description"]
+    assert SINGLE_SOURCE_LABEL not in composite(conn, "DEBOLE")["description"]
 
 
 def test_shortlist_order_is_by_score_then_coverage_then_ticker(ctx_and_conn):
@@ -544,7 +655,7 @@ def test_shortlist_size_caps_the_ranking(ctx_and_conn):
         add_news(conn, cid, [0.9, 0.9, 0.9])
     ctx.module_config["shortlist_size"] = 2
     result = Module().run(ctx)
-    assert "in shortlist=2" in result.note
+    assert "in shortlist multipla=2" in result.note
 
 
 # ── 8. regole dei singoli moduli ──────────────────────────────────────────────
@@ -967,7 +1078,7 @@ def test_conflict_does_not_change_shortlist_score_or_order(ctx_and_conn):
     assert "contrastanti" in composite(conn, "CBRS")["description"]
     assert "contrastanti" not in composite(conn, "ACCO")["description"]
     # entrambi in shortlist: il contrasto non ha escluso nessuno
-    assert "in shortlist=2" in result.note
+    assert "in shortlist multipla=2" in result.note
     # e l'ordine segue il punteggio, non l'etichetta: ACCO (+50) prima di CBRS
     assert result.note.index("ACCO=+50") < result.note.index("CBRS=+35")
 
@@ -986,35 +1097,42 @@ def insider_weight(conn, ticker):
 
 def test_insider_small_trade_is_downweighted(ctx_and_conn):
     """Caso KOD: 156.7M comprati ma 0,6% della posizione (taglio di routine).
-    Con il peso fisso era +30, il massimo possibile per un insider."""
+    Con il peso fisso era +30, il massimo possibile per un insider.
+
+    Oggi e' +4.5: 156.7M comprati ma 0.4% della posizione sono sotto la soglia
+    trascurabile dell'1%. E' la conseguenza dichiarata della scelta "la quota
+    vale il convinzione, il valore assoluto non entra": il caso resta coperto dal
+    test perche' documenta il costo della scelta, non perche' lo approvi."""
     ctx, conn, _path = ctx_and_conn
     cid = add_company(conn, "KOD")
     add_insider(conn, cid, kind="P", value=156_700_000, shares=100, holdings_after=25_000)
 
     Module().run(ctx)
     row = insider_weight(conn, "KOD")
-    assert row["magnitude"] == pytest.approx(21.0)     # 30 x 0.7 (banda sotto il 5%)
+    assert row["magnitude"] == pytest.approx(4.5)      # 30 x 0.15 (banda trascurabile)
     assert "0.4% delle posizioni" in row["description"]
+    assert "trascurabile" in row["description"]
     assert row["direction"] == 1
 
 
 def test_insider_large_stake_is_amplified(ctx_and_conn):
     """Caso ADRX: 33.3M, ma 60,7% della posizione. Il peso fisso non lo
-    distingueva da KOD. Qui e' il contributo massimo consentito."""
+    distingueva da KOD, e il tetto a 45 lo clippava senza che nulla lo dicesse."""
     ctx, conn, _path = ctx_and_conn
     cid = add_company(conn, "ADRX")
     add_insider(conn, cid, kind="P", value=33_300_000, shares=607, holdings_after=1_000)
 
     Module().run(ctx)
     row = insider_weight(conn, "ADRX")
-    assert row["magnitude"] == pytest.approx(45.0)     # 30 x 1.6 = 48, limitato a 45
+    assert row["magnitude"] == pytest.approx(48.0)     # 30 x 1.6, nessun clip
     assert "60.7% delle posizioni" in row["description"]
 
 
 def test_insider_cap_holds_even_with_many_people(ctx_and_conn):
     """30 x 1.6 x 1.35 = 64.8 non e' piu' un segnale insider: il tetto esiste
     perche' i 4 moduli insieme arrivano a +100 e un singolo modulo non puo'
-    dominare il totale."""
+    dominare il totale. Con 60 il taglio c'e' ma non morde piu' nessun segnale
+    reale: il massimo osservato era 55.2."""
     ctx, conn, _path = ctx_and_conn
     cid = add_company(conn, "BIG")
     for i in range(4):
@@ -1023,7 +1141,7 @@ def test_insider_cap_holds_even_with_many_people(ctx_and_conn):
 
     Module().run(ctx)
     row = insider_weight(conn, "BIG")
-    assert row["magnitude"] == pytest.approx(45.0)
+    assert row["magnitude"] == pytest.approx(60.0)     # 64.8 limitato a 60
     assert "4 insider distinti" in row["description"]
 
 
@@ -1071,9 +1189,12 @@ def test_insider_fraction_is_weighted_by_value(ctx_and_conn):
 
     Module().run(ctx)
     row = insider_weight(conn, "MIX")
-    # (1M x 10.0% + 90M x 0.5%) / 91M = 0.6% -> banda sotto il 5%;
-    # due persone distinte aggiungono il fattore 1.15
-    assert row["magnitude"] == pytest.approx(-16.1)     # -20 x 0.7 x 1.15
+    # (1M x 10.0% + 90M x 0.5%) / 91M = 0.6% -> banda trascurabile;
+    # due persone distinte aggiungono il fattore 1.15. Con la media semplice dei
+    # due rapporti sarebbe 5.25% (banda piena, -23): e' la prova che la media
+    # e' pesata per valore e non aritmetica.
+    assert row["magnitude"] == pytest.approx(-3.45)     # -20 x 0.15 x 1.15
+    assert "trascurabile" in row["description"]
     assert "0.6% delle posizioni" in row["description"]
 
 
@@ -1136,6 +1257,173 @@ def test_insider_fraction_coverage_is_declared(ctx_and_conn):
     desc = insider_weight(conn, "PARZ")["description"]
     assert "90.0% delle posizioni" in desc
     assert "su 90% del valore" in desc
+
+
+def test_ceiling_band_marks_a_negligible_fraction_as_trascurabile(ctx_and_conn):
+    """Sotto la soglia minima il contributo e' rumore, e lo dichiara.
+
+    Caso reale AFL: una vendita dello 0.018% della posizione prendeva -14.0, lo
+    stesso peso di un'uscita vera e piccola. Con la banda `lt` il peso scende a
+    -3.0 e la description dice PERCHE', altrimenti un contributo piccolo senza
+    spiegazione e' indistinguibile da un errore di calcolo.
+    """
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "AFL")
+    add_insider(conn, cid, kind="S", value=1_000_000, shares=18, holdings_after=100_000)
+
+    Module().run(ctx)
+    riga = insider_weight(conn, "AFL")
+    assert riga["magnitude"] == pytest.approx(-3.0), "sotto l'1% deve valere 20 x 0.15"
+    assert "trascurabile" in riga["description"]
+
+
+def test_ceiling_band_is_not_applied_above_the_threshold(ctx_and_conn):
+    """La banda trascurabile ha un tetto, non una soglia.
+
+    ABEO allo 1.501% e' una vendita reale e piccola: deve restare sulla banda
+    normale. Se la banda `lt` fosse trattata come `gte` (o se il confronto fosse
+    sbagliato), qui prenderebbe 0.15 e la distinzione che la modifica voleva
+    conservare sparirebbe.
+    """
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "ABEO")
+    # 1501/(1501+100000) = 1.48%: sopra l'1%, quindi banda normale 0.7
+    add_insider(conn, cid, kind="S", value=1_000_000, shares=1501, holdings_after=100_000)
+
+    Module().run(ctx)
+    riga = insider_weight(conn, "ABEO")
+    assert riga["magnitude"] == pytest.approx(-14.0), "1.48% e' sopra l'1%: banda 0.7, non 0.15"
+    assert "trascurabile" not in riga["description"]
+
+
+def test_ceiling_band_boundary_is_exactly_at_the_configured_fraction(ctx_and_conn):
+    """Il tetto e' STRETTO: esattamente l'1% e' gia' segnale.
+
+    Il confine e' arbitrario in un senso e non nell'altro, e il codice deve
+    dichiarare quale ha scelto: sotto `lt` il valore prende il tetto, alla soglia
+    esatta prende la banda normale. Senza questo test un refactor da `<` a `<=`
+    cambierebbe il peso di casi reali senza accorgersene.
+    """
+    ctx, conn, _path = ctx_and_conn
+    sotto = add_company(conn, "SOTTO")
+    # 999/(999+100000) = 0.99%
+    add_insider(conn, sotto, kind="S", value=1_000_000, shares=999, holdings_after=100_000)
+    uguale = add_company(conn, "UGUALE")
+    # 1000/(1000+99000) = 1.00% esatto
+    add_insider(conn, uguale, kind="S", value=1_000_000, shares=1000, holdings_after=99_000)
+
+    Module().run(ctx)
+    assert insider_weight(conn, "SOTTO")["magnitude"] == pytest.approx(-3.0)
+    assert insider_weight(conn, "UGUALE")["magnitude"] == pytest.approx(-14.0)
+    assert "trascurabile" in insider_weight(conn, "SOTTO")["description"]
+    assert "trascurabile" not in insider_weight(conn, "UGUALE")["description"]
+
+
+def test_ceiling_band_is_symmetric_between_buy_and_sell(ctx_and_conn):
+    """33.7M di convinzione privata non dimostrano convinzione.
+
+    Se la banda trascurabile valesse solo sulle vendite, un acquisto dello 0.5%
+    continuerebbe a pesare come un acquisto vero: la simmetria scelta in config
+    deve arrivare fino al contributo.
+    """
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "CRBG")
+    add_insider(conn, cid, kind="P", value=33_700_000, shares=470, holdings_after=100_000)
+
+    Module().run(ctx)
+    riga = insider_weight(conn, "CRBG")
+    assert riga["magnitude"] == pytest.approx(4.5), "acquisto sotto l'1% vale 30 x 0.15"
+    assert "trascurabile" in riga["description"]
+
+
+def test_bands_without_ceiling_keep_the_previous_weights(ctx_and_conn):
+    """Una config senza `lt` deve produrre esattamente i pesi di prima.
+
+    La banda trascurabile e' un'aggiunta, non un cambio di contratto: se
+    sparisse, ogni fixture e ogni run passato darebbero risultati diversi senza
+    che nessuno lo abbia chiesto.
+    """
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "OLD")
+    add_insider(conn, cid, kind="S", value=1_000_000, shares=18, holdings_after=100_000)
+
+    ctx.module_config["insider_scale"] = {
+        **INSIDER_SCALE,
+        "frac_sell": [
+            {"gte": 0.50, "mult": 1.6}, {"gte": 0.20, "mult": 1.3},
+            {"gte": 0.05, "mult": 1.0}, {"gte": 0.0, "mult": 0.7},
+        ],
+    }
+    Module().run(ctx)
+    riga = insider_weight(conn, "OLD")
+    assert riga["magnitude"] == pytest.approx(-14.0), "senza 'lt' resta il vecchio 20 x 0.7"
+    assert "trascurabile" not in riga["description"]
+
+
+def test_ceiling_band_must_come_first_or_it_is_reported(ctx_and_conn):
+    """Una banda `lt` non in testa e' una config che sembra funzionare e non
+    fa niente: va in errors[], non accettata in silenzio.
+
+    Sotto la soglia di un tetto precedente la banda successiva non viene mai
+    valutata, quindi l'errore silenzioso sarebbe il caso peggiore: l'utente
+    crederebbe di aver abbassato il rumore e non sarebbe successo nulla.
+    """
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "BADLT")
+    add_insider(conn, cid, kind="P", value=1_000_000)
+    ctx.module_config["insider_scale"] = {
+        **INSIDER_SCALE,
+        "frac_buy": [{"gte": 0.5, "mult": 1.6}, {"lt": 0.01, "mult": 0.15}],
+    }
+
+    result = Module().run(ctx)
+    assert any("banda non valida" in e and "prima" in e for e in result.errors), result.errors
+
+
+def test_band_cannot_be_ceiling_and_floor_at_once(ctx_and_conn):
+    """`gte` e `lt` sulla stessa banda e' una banda che non ha un significato:
+    nessun numero la soddisferebbe, o tutti, a seconda di come si legge. Va
+    segnalata invece di interpretata."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "BOTTA")
+    add_insider(conn, cid, kind="P", value=1_000_000)
+    ctx.module_config["insider_scale"] = {
+        **INSIDER_SCALE,
+        "frac_buy": [{"gte": 0.5, "lt": 0.1, "mult": 1.6}],
+    }
+
+    result = Module().run(ctx)
+    assert any("banda non valida" in e and "lt" in e for e in result.errors), result.errors
+
+
+def test_max_abs_from_config_caps_theory_but_not_real_signals(ctx_and_conn):
+    """Il tetto assoluto deve tagliare il teorico e non i segnali reali.
+
+    30 x 1.6 x 1.35 = 64.8 e' il massimo possibile e non deve arrivare intatto
+    in tabella; ma un contributo da 55.2 (XENE, ADRX nella finestra reale) e' un
+    segnale vero e con `max_abs: 45` spariva, clippato senza che nulla lo
+    dichiarasse. Il tetto vale 60 proprio per questo.
+    """
+    ctx, conn, _path = ctx_and_conn
+    teorico = add_company(conn, "TEOR")
+    for i in range(4):     # 30 x 1.6 x 1.35 = 64.8, il massimo possibile
+        add_insider(conn, teorico, kind="P", value=10_000_000, shares=1000,
+                    holdings_after=1000, insider_name=f"INSIDER {i}", days_ago=i + 1)
+    # una persona sola, quota 100%: 48.0, un segnale reale
+    reale = add_company(conn, "REALE")
+    add_insider(conn, reale, kind="P", value=10_000_000, shares=1000, holdings_after=1000)
+
+    Module().run(ctx)
+    assert insider_weight(conn, "TEOR")["magnitude"] == pytest.approx(60.0)
+    assert insider_weight(conn, "REALE")["magnitude"] == pytest.approx(48.0)
+
+    # e con il tetto a 45, che era il valore di prima: il segnale da 48 spariva.
+    # Serve `recalc`, altrimenti la riga scritta col tetto a 60 resterebbe li' e
+    # il test leggerebbe il valore vecchio senza accorgersene.
+    ctx.module_config["recalc"] = True
+    ctx.module_config["insider_scale"] = {**INSIDER_SCALE, "max_abs": 45}
+    Module().run(ctx)
+    assert insider_weight(conn, "REALE")["magnitude"] == pytest.approx(45.0)
 
 
 def test_insider_bands_come_from_config(ctx_and_conn):

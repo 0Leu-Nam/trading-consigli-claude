@@ -63,6 +63,14 @@ SOURCE_MODULES = (
 # (M, F, A, C, D, G) sono esercizi, assegnazioni o donazioni, non convinzione.
 TRANSACTION_TYPES = {"P": "insider_open_market_buy", "S": "insider_open_market_sell"}
 
+# Etichetta dei ticker a fonte singola. Va nella **description della riga di
+# sintesi**, non solo nella `note`: la Fase 7 legge la tabella e deve poter
+# separare le due sezioni con una query, senza ricalcolare coperture ne' voti.
+# "Da una sola fonte" e' un fatto, non un piazzamento in classifica: un ticker
+# puo' portare l'etichetta anche se il tetto di `single_source_limit` lo tiene
+# fuori dalla lista mostrata.
+SINGLE_SOURCE_LABEL = "segnale da una sola fonte, nessuna conferma incrociata"
+
 
 class Module(ModuleInterface):
     key = "scoring"
@@ -78,6 +86,9 @@ class Module(ModuleInterface):
         conflict_min_weight = int(conf.get("conflict_min_weight", 10))
         scale = dict(conf.get("insider_scale") or {})
         warn_inst_age = int(conf.get("warn_institutional_age_days", 150))
+        single_min = conf.get("single_source_min")
+        single_min = None if single_min is None else float(single_min)
+        single_limit = int(conf.get("single_source_limit", 10))
 
         if not weights:
             return ModuleResult(
@@ -159,6 +170,15 @@ class Module(ModuleInterface):
                 # riga di sintesi: il totale e' la somma dei pesi effettivi e
                 # la description dichiara la copertura, cosi' uno score 60 su 2
                 # moduli non e' confrontabile con uno 60 su 4 senza leggerlo.
+                # L'appartenenza a una sezione e' decisa qui, per ticker, senza
+                # aspettare la classifica: dipende solo dalla copertura e dal
+                # totale, entrambi noti. Il tetto di lista (`single_source_limit`)
+                # e' un'altra cosa, e viene dopo.
+                single_source = (
+                    single_min is not None
+                    and modules_seen < min_signals
+                    and total >= single_min
+                )
                 written += self._insert(
                     ctx.conn,
                     company_id=company_id,
@@ -172,6 +192,7 @@ class Module(ModuleInterface):
                         f"score {total:+.1f} da {len(merged)} contributi, "
                         f"copertura {modules_seen}/{len(SOURCE_MODULES)} ({covered})"
                         + (f"; {conflict}" if conflict else "")
+                        + (f"; {SINGLE_SOURCE_LABEL}" if single_source else "")
                     ),
                     recalc=recalc,
                 )
@@ -186,7 +207,9 @@ class Module(ModuleInterface):
                 log.warning("scoring: ticker non valutato (company_id=%s): %s", company_id, exc)
                 errors.append(f"scoring: company_id={company_id} non valutata: {exc}")
 
-        shortlist = _shortlist_of(scored, min_signals, shortlist_size)
+        multi, single = _shortlist_sections(
+            scored, min_signals, shortlist_size, single_min, single_limit
+        )
 
         if not scored:
             errors.append(
@@ -200,7 +223,10 @@ class Module(ModuleInterface):
             rows_written=rows_written,
             errors=errors,
             watermark=signal_date,
-            note=self._note(scored, shortlist, errors, ignored, institutional, warn_inst_age),
+            note=self._note(
+                scored, multi, single, errors, ignored, institutional,
+                warn_inst_age, single_min,
+            ),
         )
 
     # ── raccolta ───────────────────────────────────────────────────────────────
@@ -325,11 +351,19 @@ class Module(ModuleInterface):
         return cur.rowcount
 
     @staticmethod
-    def _note(scored, shortlist, errors, ignored, institutional, warn_age) -> str:
-        ranked = ", ".join(f"{t}={s:+.0f}" for s, _n, t, _c, *_ in shortlist[:5])
+    def _note(scored, multi, single, errors, ignored, institutional, warn_age,
+              single_min) -> str:
+        # Ogni sezione ha la propria riga di top: sono due elenchi che non sono
+        # confrontabili, e accostarli in una riga sola ("top: ...") farebbe
+        # sembrare il +55 a fonte singola piu' convincente del +35 a due moduli.
+        def _top(sezione):
+            return ", ".join(f"{t}={s:+.0f}" for s, _n, t, _c, *_ in sezione[:5])
+
         base = (
-            f"ticker valutati={len(scored)}, in shortlist={len(shortlist)} "
-            f"(min_signals), ignorati da watchlist={len(ignored)}"
+            f"ticker valutati={len(scored)}, in shortlist multipla={len(multi)} "
+            f"(min_signals), in shortlist fonte singola={len(single)} "
+            + ("disabilitata" if single_min is None else f"(>={single_min:+.0f})")
+            + f", ignorati da watchlist={len(ignored)}"
         )
         # Il conteggio dei contrasti va in note perche' la shortlist e' la lista
         # che l'utente legge per prima: se 4 dei primi 25 hanno segnali che si
@@ -343,8 +377,10 @@ class Module(ModuleInterface):
                 + ")"
             )
         base += _institutional_age_note(institutional, warn_age)
-        if ranked:
-            base += f"; top: {ranked}"
+        if multi:
+            base += f"; top multipla: {_top(multi)}"
+        if single:
+            base += f"; top fonte singola: {_top(single)}"
         if errors:
             base += f"; {len(errors)} problemi (vedi errors)"
         return base
@@ -377,22 +413,48 @@ def _institutional_age_note(institutional, warn_age: int) -> str:
 
 
 def _bands(raw) -> sources.Bands:
-    """Da YAML a tuple (soglia, moltiplicatore), nell'ordine in cui sono scritte.
+    """Da YAML a tuple (soglia, moltiplicatore, e_un_tetto), nell'ordine in cui
+    sono scritte.
 
     Le soglie si scendono: la prima che il valore soddisfa vince, e l'ultima
     voce e' il piano (il valore piu' piccolo possibile ha comunque un peso).
-    `gte_usd` e `gte` sono la stessa chiave con due unita' diverse ( dollari o
+    `gte_usd` e `gte` sono la stessa chiave con due unita' diverse (dollari o
     frazione di posizione), perche' nella config gli importi e le frazioni non
     possono finire nella stessa lista.
+
+    Una banda puo' anche essere un **tetto** (`lt` invece di `gte`): serve a
+    svalutare quello che sta sotto una soglia minima, perche' una quota di
+    posizione vicina allo zero non e' un segnale debole, e' assenza di segnale.
+    I tetti si valutano prima di tutte le altre bande, quindi una banda `lt` e'
+    obbligata a essere la **prima** voce: metterla piu' in la' la renderebbe
+    irraggiungibile (sotto la prima soglia si prende gia' il suo moltiplicatore),
+    e una config che sembra funzionare ma non fa niente e' peggio di un errore.
     """
     if not raw:
         return ()
     bands: sources.Bands = ()
-    for item in raw:
-        threshold = item.get("gte", item.get("gte_usd"))
-        if threshold is None or "mult" not in item:
-            raise ValueError(f"banda non valida {item!r}: servono 'gte' (o 'gte_usd') e 'mult'")
-        bands += ((float(threshold), float(item["mult"])),)
+    for position, item in enumerate(raw):
+        has_gte = "gte" in item or "gte_usd" in item
+        has_lt = "lt" in item
+        if has_gte and has_lt:
+            raise ValueError(
+                f"banda non valida {item!r}: 'gte' e 'lt' sulla stessa banda, "
+                "una banda e' un tetto oppure un floor, non entrambi"
+            )
+        if not has_gte and not has_lt:
+            raise ValueError(
+                f"banda non valida {item!r}: servono 'gte' (o 'gte_usd') o 'lt', e 'mult'"
+            )
+        if "mult" not in item:
+            raise ValueError(f"banda non valida {item!r}: manca 'mult'")
+        if has_lt and position != 0:
+            raise ValueError(
+                f"banda non valida {item!r}: una banda 'lt' deve essere la prima, "
+                f"e' la posizione {position}: sotto la soglia di un tetto "
+                "precedente la banda successiva non viene mai valutata"
+            )
+        threshold = float(item["lt"] if has_lt else item.get("gte", item.get("gte_usd")))
+        bands += ((threshold, float(item["mult"]), has_lt),)
     return bands
 
 
@@ -456,13 +518,39 @@ def _conflict(merged, min_weight: int) -> str:
     )
 
 
-def _shortlist_of(scored, min_signals, limit):
-    """Ordina per score decrescente, poi per copertura, poi per ticker.
+def _shortlist_sections(scored, min_signals, limit, single_min, single_limit):
+    """Due sezioni tenute separate, non un unico ranking.
 
-    I due tie-breaker servono a rendere l'output deterministico a parita' di
-    punteggio: senza, l'ordine dipenderebbe dall'ordine di arrivo delle query
-    e due run identici potrebbero produrre shortlist diverse.
+    **Convergenza multipla**: almeno `min_signals` moduli distinti. Il
+    comportamento di prima: il dato e'incrociato da due fonti indipendenti.
+
+    **Convinzione forte a fonte singola**: un solo modulo, ma un punteggio
+    sopra `single_min`. Serve perche' `min_signals` escludeva i segnali piu'
+    puri del run: nella finestra reale sei ticker a +45 (fra cui CLPR, un insider
+    che compra il 100% della propria posizione) restavano fuori solo perche'
+    nessuna seconda fonte li confermava. Non sono rumore, sono **non confermati**,
+    che e' una informazione diversa.
+
+    Le due liste non si mescolano: un +55 a fonte singola e un +35 a due moduli
+    non sono confrontabili, e metterli in fila unica farebbe sembrare il primo
+    piu' convincente del secondo. Ogni sezione ha il proprio tetto, cosi' la
+    seconda non puo' sommergere la prima.
+
+    L'ordinamento dentro ogni sezione e' per punteggio decrescente, poi
+    copertura, poi ticker: senza i due tie-breaker due run identici potrebbero
+    produrre shortlist diverse.
     """
-    ranked = [row for row in scored if row[1] >= min_signals]
-    ranked.sort(key=lambda r: (-r[0], -r[1], r[2]))
-    return ranked[:limit]
+    multi = [row for row in scored if row[1] >= min_signals]
+    # `single_min = None` vuol dire sezione 2 DISABILITATA, cioe' il comportamento
+    # di prima della modifica. Non `0`: con la soglia a zero ogni ticker a un
+    # solo modulo entrerebbe in shortlist, e una chiave dimenticata in config
+    # cambierebbe il risultato invece di lasciare le cose come erano.
+    single = [
+        row for row in scored
+        if single_min is not None
+        and row[1] < min_signals
+        and row[0] >= single_min
+    ]
+    for sezione in (multi, single):
+        sezione.sort(key=lambda r: (-r[0], -r[1], r[2]))
+    return multi[:limit], single[:single_limit]

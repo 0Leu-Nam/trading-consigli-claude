@@ -166,14 +166,53 @@ distingue due eventi opposti. Misurato sul DB reale:
 
 | ticker | operazione | valore | insider distinti | frazione di posizione | prima | dopo |
 |---|---|---|---|---|---|---|
-| KOD | acquisto | 156.7M | 1 | 0.6% | +30 | **+21** |
-| ADRX | acquisto | 33.3M | 3 | 60.7% | +30 | **+45** |
-| MPWR | vendita | 40.3M | 1 | 0.8% | −20 | **−14** |
+| KOD | acquisto | 156.7M | 1 | 0.6% | +30 | **+4.5** |
+| ADRX | acquisto | 33.3M | 3 | 60.7% | +30 | **+55.2** |
+| MPWR | vendita | 40.3M | 1 | 0.8% | −20 | **−3** |
 | CX | vendita | 8.9M | 1 | 61.3% | −20 | **−32** |
 | ABEO | vendita | 101K | 1 | n/d | −20 | **−7** |
+| AFL | vendita | 2.7M | 1 | 0.018% | −20 | **−3** |
 
 Un taglio di routine dello 0.6% della propria posizione e una vendita del 61%
 di quella posizione avevano lo stesso peso.
+
+**Sotto l'1% di quota il contributo è trascurabile.** La banda bassa
+`gte: 0.0 → 0.7` rispondeva a *quanto* ha venduto, ma non a *ha venduto
+qualcosa*: AFL vendeva lo **0.018%** della posizione e prendeva −14, il peso di
+un'uscita vera e piccola. Una banda con `lt` in testa alla lista risolve:
+
+```yaml
+frac_sell: [{lt: 0.01, mult: 0.15}, {gte: 0.50, mult: 1.6}, ...]
+```
+
+- il tetto è **stretto**: sotto l'1% prende 0.15, esattamente l'1% resta sulla
+  banda normale;
+- è **simmetrico** su acquisti e vendite, perché comprare lo 0.5% della propria
+  posizione non dimostra convinzione nemmeno se costa 33.7M (CRBG: `+21 → +4.5`);
+- la description lo dichiara: un contributo piccolo senza spiegazione è
+  indistinguibile da un errore di calcolo, quindi scrive
+  `0.5% delle posizioni (trascurabile: sotto la soglia minima di quota)`;
+- una banda `lt` deve essere **la prima voce**: sotto la soglia di un tetto
+  precedente la banda successiva non viene mai valutata, e una config che sembra
+  funzionare ma non fa niente è un errore di config, non una scelta. Il modulo lo
+  segnala in `errors[]`.
+
+La soglia è all'1% e non al 2% perché ABEO (1.5%) è una vendita reale e piccola: a
+2% finirebbe insieme ad AFL e la distinzione che si voleva conservare sparirebbe.
+
+**Il costo dichiarato:** con la banda simmetrica KOD esce dai candidati. Compra
+156.7M ma solo lo 0.586% della propria posizione, e il contributo passa da `+21` a
+`+4.5`. È la scelta "la quota vale il convinzione" applicata senza eccezioni: il
+valore in dollari assoluto non entra nella formula, quindi un segnale forte in
+dollari con quota minima si perde. Se in futuro questo costasse troppo, il rimedio
+giusto è un segnale **distinto** (una banda in dollari assoluti), non un altro
+aggiustamento di peso su questa.
+
+`max_abs` è 60 e non 45. Con 45 sparivano sei acquisti reali, per clippare a 48-55
+contributi che erano segnali veri: le vendite reali non raggiungevano mai il tetto
+(massimo osservato 36.8), quindi il limite tagliava solo dal lato dei compratori.
+60 taglia ancora il caso teorico (30 × 1.6 × 1.35 = 64.8) e lascia stare i segnali
+veri.
 
 La frazione di posizione è media **pesata per valore**:
 - acquisto: `shares / holdings_after` (quota comprata);
@@ -257,9 +296,41 @@ KLAC +35.0  score +35.0 da 2 contributi, copertura 2/4 (institutional_holdings,p
 Uno score di 60 su 2 moduli non è confrontabile con uno di 60 su 4 senza
 leggere la copertura, ed è per questo che è scritta nella riga.
 
-`min_signals` (default 2) tiene fuori dalla shortlist i punteggi costruiti su
-una sola fonte. **La riga resta in tabella**: la shortlist è un filtro di
-lettura, non di scrittura.
+### Due sezioni, non un unico ranking
+
+`min_signals` (default 2) non è un filtro: è il confine fra due sezioni.
+
+| sezione | chi ci va | tetto |
+|---|---|---|
+| **Convergenza multipla** | almeno `min_signals` moduli distinti | `shortlist_size` (25) |
+| **Convinzione forte a fonte singola** | un solo modulo, ma score ≥ `single_source_min` (40) | `single_source_limit` (10) |
+
+**Le due liste non si mescolano.** Un +55 a fonte singola e un +35 a due moduli
+non sono confrontabili: accostarli in una classifica unica farebbe sembrare il
+primo più convincente del secondo, e il primo è il dato più fragile del run.
+Ogni sezione ha il proprio tetto, così la seconda non può sommergere la prima.
+
+La sezione 2 serve perché `min_signals` escludeva i segnali più puri del run:
+nella finestra reale sei ticker a +45 (fra cui CLPR, un insider che compra il
+100% della propria posizione) restavano fuori solo perché nessuna seconda fonte
+li confermava. Non sono rumore, sono **non confermati**, che è un'informazione
+diversa. `single_source_min: 40` sta nel vuoto naturale della finestra: sotto
+c'era 39, sopra 45.
+
+Ogni ticker della sezione 2 porta nella riga di sintesi l'etichetta
+`segnale da una sola fonte, nessuna conferma incrociata`, così la Fase 7 le
+separa con una query senza ricalcolare coperture né voti. L'etichetta compare
+per chi è **candidato** della sezione 2 (copertura 1 e score ≥ soglia): sotto la
+soglia non è un candidato e scrivere "fonte singola" direbbe il vero a metà.
+
+**La riga resta in tabella in ogni caso**: la shortlist è un filtro di lettura,
+non di scrittura.
+
+Se `single_source_min` manca dalla config, la sezione 2 è disabilitata
+(comportamento di prima della modifica) e la `note` lo dice: `fonte singola=0
+disabilitata`. Non ha default `0`, perché con la soglia a zero ogni ticker a un
+solo modulo entrerebbe in shortlist e una chiave dimenticata cambierebbe il
+risultato invece di lasciare le cose come erano.
 
 ### Come è tracciabile
 
@@ -271,7 +342,7 @@ Nessuna migrazione di schema: si riusa il vincolo
   `description="acquisto open-market 33.3M da 3 insider distinti su 7 dichiarazioni, 60.7% delle posizioni"`
 - **una riga di sintesi** per ticker: `module_key='scoring'`,
   `signal_type='composite'`, `magnitude` = totale, `description` = riepilogo
-  dei contributi e della copertura.
+  dei contributi, della copertura, dell'eventuale contrasto e della sezione.
 
 La dashboard (Fase 7) mostra il totale e i dettagli con due query, senza
 parsing di JSON e senza ricalcolare nulla.
@@ -296,7 +367,8 @@ nasce una riga nuova, come negli altri moduli.
 Un extractor che solleva non ferma gli altri: gli altri moduli contribuiscono,
 l'errore resta in `errors[]` e il run viene classificato `warning`. Un'assenza
 di dati non genera errori. `note` riporta quanti ticker sono stati valutati,
-quanti in shortlist e quanti ignorati da watchlist.
+quanti in ciascuna sezione di shortlist (con la soglia in chiaro) e quanti
+ignorati da watchlist.
 
 ### Segnali contrastanti
 

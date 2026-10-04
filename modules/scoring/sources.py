@@ -23,7 +23,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-Bands = tuple[tuple[float, float], ...]
+# Una banda e' `(soglia, moltiplicatore, e_un_tetto)`. Con `e_un_tetto = False`
+# la banda soddisfa `value >= soglia`; con `True` soddisfa `value < soglia` e
+# serve per i valori che vanno **svalutati** (una quota di posizione vicina allo
+# zero non e' rumore da floor, e' assenza di segnale). Le bande coi tetti si
+# valutano prima di tutte le altre, perche' altrimenti un valore sotto il tetto
+# prenderebbe la banda `gte: 0.0` e il tetto non servirebbe a nulla.
+Bands = tuple[tuple[float, float, bool], ...]
 
 
 @dataclass(frozen=True)
@@ -76,15 +82,26 @@ def _fmt_usd(value: float | int | None) -> str:
     return f"{v:.0f}"
 
 
-def _mult(value: float, bands: Bands) -> float:
-    """Moltiplicatore dalla prima banda satisfied. L'ultima banda e' il piano:
-    con `[{gte: .5, mult: 1.6}, ..., {gte: 0, mult: 0.7}]` il valore 0.03
-    prende 0.7 e non resta senza moltiplicatore.
+def _band_match(value: float, bands: Bands) -> tuple[float, bool]:
+    """`(moltiplicatore, provenienza da un tetto)` per la prima banda soddisfatta.
+
+    Con `[{gte: .5, mult: 1.6}, ..., {gte: 0, mult: 0.7}]` il valore 0.03
+    prende 0.7 e non resta senza moltiplicatore. Una banda con `lt` si valuta
+    prima di tutte le altre: `{lt: 0.01, mult: 0.15}` fa prendere 0.15 a tutto
+    quello che sta sotto l'1%, che altrimenti finirebbe sulla banda bassa 0.7.
+
+    Il secondo valore serve al chiamante per **dichiarare** nella description che
+    il contributo e' stato svalutato perche' sotto la soglia minima: un peso
+    piccolo senza spiegazione e' indistinguibile da un errore di calcolo.
     """
-    for threshold, mult in bands:
-        if value >= threshold:
-            return mult
-    return bands[-1][1] if bands else 1.0
+    for threshold, mult, is_ceiling in bands:
+        if (value < threshold) if is_ceiling else (value >= threshold):
+            return mult, is_ceiling
+    return (bands[-1][1], False) if bands else (1.0, False)
+
+
+def _mult(value: float, bands: Bands) -> float:
+    return _band_match(value, bands)[0]
 
 
 # ── insider_trading ────────────────────────────────────────────────────────────
@@ -122,6 +139,23 @@ def insider_signals(
     e' quindi `peso_base x banda(frazione di posizione) x banda(n. insider)`,
     limitato a `max_abs`: la frazione e' l'unica misura confrontabile tra una
     microcap e una mega-cap, perche' il valore in dollari assoluto no.
+
+    **La banda con `lt` serve per la quota trascurabile, non per il floor.** La
+    banda bassa `gte: 0.0 -> 0.7` rispondeva a "quanto ha venduto", ma non a "ha
+    venduto qualcosa": AFL vendeva lo **0.018%** della sua posizione e prendeva
+    `-14.0`, lo stesso peso di un'uscita vera e piccola. Con `{lt: 0.01, mult:
+    0.15}` in testa alla lista, sotto l'1% il contributo diventa `-3.0`. Il
+    taglio e' all'1% e non al 2% perche' ABEO (1.501%) e' una vendita reale e
+    piccola: a 2% sarebbe finito insieme ad AFL e la distinzione che si voleva
+    conservare sarebbe sparita.
+
+    La banda e' **simmetrica su acquisti e vendite**, perche' comprare lo 0.5%
+    della propria posizione non dimostra convinzione nemmeno se costa 33.7M: in
+    quel caso CRBG passa da `+21.0` a `+4.5` e KOD (156.7M allo 0.586%) esce
+    dai candidati. E' il prezzo della scelta "la quota vale il convinzione": il
+    valore in dollari assoluto non entra nella formula, e un segnale forte in
+    dollari con quota minima si perde. Se in futuro questo costasse troppo, il
+    rimedio giusto e' un segnale **distinto**, non un peso da riaggiustare qui.
 
     La frazione e' media PONDERATA PER VALORE fra le dichiarazioni con
     `holdings_after`: un direttore che vende tutta la sua posizione conta per
@@ -184,8 +218,10 @@ def insider_signals(
 
         if frac is not None:
             frac_bands = frac_buy if kind == "P" else frac_sell
-            size_mult = _mult(frac, frac_bands)
+            size_mult, from_ceiling = _band_match(frac, frac_bands)
             frac_note = f", {frac * 100:.1f}% delle posizioni"
+            if from_ceiling:
+                frac_note += " (trascurabile: sotto la soglia minima di quota)"
             if row["frac_den"] < value:
                 frac_note += f" (su {_pct(row['frac_den'], value)} del valore)"
         else:

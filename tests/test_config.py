@@ -79,6 +79,17 @@ def test_scoring_weights_are_configured_and_documented():
     )
     assert scoring["warn_institutional_age_days"] > 0, "serve una soglia per l'avviso in note"
 
+    # Le due sezioni di shortlist hanno soglie e tetti separati. `single_source_min`
+    # non puo' mancare: senza, il modulo la tratta come "sezione disabilitata" e i
+    # sei ticker a +45 della finestra reale tornano fuori dalla shortlist senza che
+    # nessuno lo legga da config.
+    assert "single_source_min" in scoring, "manca la soglia della sezione a fonte singola"
+    assert scoring["single_source_min"] > scoring["min_signals"], (
+        "la soglia del fonte singola e' uno score, non un conteggio di moduli"
+    )
+    assert scoring["single_source_limit"] > 0, "serve un tetto alla sezione fonte singola"
+    assert scoring["shortlist_size"] > 0
+
 
 def test_scoring_insider_scale_is_complete_and_ordered():
     """La scala del contributo insider.
@@ -95,10 +106,29 @@ def test_scoring_insider_scale_is_complete_and_ordered():
     for lato in ("frac_buy", "frac_sell"):
         bande = scale[lato]
         assert len(bande) >= 2, f"{lato}: serve almeno una soglia e un piano"
-        soglie = [b["gte"] for b in bande]
+        # La banda trascurabile (`lt`) sta FUORI dal controllo di discesa: e'
+        # un tetto, non un floor, e il suo 0.01 non ha niente a che fare con
+        # l'ordine delle soglie 0.50 / 0.20 / 0.05 / 0.0 sotto di lei. Misurarla
+        # insieme produrrebbe un falso "le soglie non scendono".
+        tetti = [b for b in bande if "lt" in b]
+        assert len(tetti) == 1, f"{lato}: serve una sola banda trascurabile, non {len(tetti)}"
+        assert tetti[0] == bande[0], f"{lato}: la banda 'lt' deve essere la prima, altrimenti non viene mai valutata"
+        soglie = [b["gte"] for b in bande if "gte" in b]
         assert soglie == sorted(soglie, reverse=True), f"{lato}: le soglie devono scendere"
         assert soglie[-1] <= 0.0, f"{lato}: l'ultima voce e' il piano, deve coprire il minimo"
         assert all(b.get("mult", 0) > 0 for b in bande), f"{lato}: moltiplicatore mancante"
+
+    # La banda trascurabile deve essere uguale da entrambi i lati: comprare lo
+    # 0.5% della propria posizione non dimostra convinzione nemmeno quando
+    # l'importo e' grosso, quindi asimmetria qui significherebbe che la
+    # simmetria scelta non e' mai stata applicata davvero.
+    assert scale["frac_buy"][0] == scale["frac_sell"][0], (
+        "la soglia trascurabile deve essere simmetrica su acquisti e vendite"
+    )
+    assert 0 < scale["frac_buy"][0]["lt"] <= 0.02, (
+        "la soglia trascurabile deve restare sotto il 2%: ABEO (1.501%) e' una "
+        "vendita reale e a 2% verrebbe sommersa insieme al rumore (AFL 0.018%)"
+    )
 
     conteggio = [b["gte"] for b in scale["by_insider_count"]]
     assert conteggio[0] >= 4 and conteggio[-1] == 1, "la banda sul numero di persone deve partire da 4 e finire a 1"
@@ -118,6 +148,9 @@ def test_scoring_insider_scale_is_complete_and_ordered():
         * max(b["mult"] for b in scale["by_insider_count"])
     )
     assert scale["max_abs"] < 30 * peggiore, "il tetto deve tagliare davvero, non essere decorativo"
+    # ...ma non deve tagliare i segnali che ci sono davvero: con 45 sparivano
+    # sei acquisti reali, per clippare contributi che valevano 55.2 (XENE, ADRX).
+    assert scale["max_abs"] >= 56, "45 tagliava segnali reali a 55.2: il tetto era troppo basso"
 
 
 def test_institutional_whitelist_ciks_are_ten_digit_and_unique():

@@ -2,7 +2,7 @@
 
 ## Stato attuale
 - Fase in corso: 6 — scoring / aggregazione dei 4 moduli in un punteggio per ticker
-- Percentuale completamento fase: implementazione e test locali COMPLETI (209/209 verdi), modulo **disabilitato** (`enabled: false`) → resta l'osservazione locale prima del flip.
+- Percentuale completamento fase: implementazione e test locali COMPLETI (220/220 verdi), modulo **disabilitato** (`enabled: false`) → resta l'osservazione locale prima del flip.
 - Fase 5: 100% — `institutional_holdings` **attivata in produzione** (`enabled: true`, 2026-10-01) con whitelist di 3 gestori.
 - Fase 4: 100% — `news_sentiment` **attivata in produzione** (`enabled: true`, 2026-09-30).
 - Fase 3: 100% — validata in produzione.
@@ -10,6 +10,7 @@
 - Fase 1: 100%.
 
 ## Ultima sessione conclusa
+- **Sessione 2026-10-04b — shortlist in due sezioni, soglia trascurabile 1%, tetto insider a 60, produzione OFF**: `min_signals` escludeva i segnali piu' puri del run (sei ticker a +45, fra cui CLPR che compra il 100% della sua posizione) perche' erano a fonte singola: ora ci sono due sezioni separate, "convergenza multipla" e "convinzione forte a fonte singola" (`single_source_min: 40`), che non si mescolano in un ranking unico. La banda bassa rispondeva a "quanto ha venduto" ma non a "ha venduto qualcosa" (AFL allo 0.018% pesava come un'uscita vera): aggiunta una banda con tetto `lt: 0.01`, simmetrica su acquisti e vendite, che dichiara il "trascurabile" in description. `max_abs` riportato da 45 a 60: tagliava sei acquisti reali per fermare solo il caso teorico, e le vendite non ci arrivavano mai. 220/220 verdi. 18 contributi svalutati sotto l'1% (fra cui CRBG 33.7M e KOD 156.7M, che con la banda simmetrica esce dai candidati: conseguenza accettata della scelta "quota di posizione, non valore assoluto"). Dettagli in "Fase 6".
 - **Sessione 2026-10-04 — correzioni pre-flip di Fase 6, produzione OFF**: il peso insider non era piu' fisso (un taglio dello 0,6% della posizione e una vendita del 61% avevano lo stesso peso), l'eta' del 13F si contava dalla fine del trimestre invece che dal deposito, il numero di insider contava le righe di Form 4 invece che le persone, e le finestre dipendevano dall'orologio di sistema. 209/209 verdi. La shortlist sul DB reale non cambia di composizione (13 ticker prima e dopo): cambiano i punteggi. Dettagli in "Fase 6".
 - **Sessione 2026-10-03 — Fase 6 implementata (scoring), produzione OFF**: il modulo non raccoglie dati, legge le 4 tabelle degli altri moduli e scrive in `signals` una riga per contributo piu' una di sintesi per ticker. 185/185 verdi. La scelta di base e' stata presa **misurando la copertura reale prima di progettare** (nessuna company ha tutti e 4 i segnali), da qui la regola "un modulo che non parla contribuisce 0 e non penalizza" con copertura `N/4` esplicita in ogni riga. 4 difetti trovati misurando (segno di `abs_return_5d`, `shares_delta` NULL, join prezzo per `symbol`, rumore del sentiment) e 1 fallimento silenzioso chiuso (contributi con la stessa chiave UNIQUE scartati in silenzio, 15 punti persi). Dettagli in "Fase 6".
 - **Sessione 2026-10-01 — flip Fase 5: `institutional_holdings` attivata in produzione** con whitelist di 3 gestori (Altimeter Capital, Situational Awareness LP, Baker Bros. Advisors) e budget ristretto. Tre parametri ritoccati oltre l'`enabled` perche' misurati, non ipotizzati: `lag_days` 45→60, `max_filings` 120→6, `max_filings_scan` 2000→200. `tests/test_config.py` aggiornato a 4 moduli attivi + test sui CIK del whitelist (140/140 verdi). Motivazione dei gestori e limite strutturale del 13F nelle sezioni "Gestori scelti" e "Il 13F conferma, non anticipa".
@@ -136,12 +137,51 @@ Il contributo e' ora `peso_base x banda(frazione di posizione) x banda(numero di
 - `data/app.db` **non e' stato toccato**: il probe gira su una copia temporanea e poi la cancella
 - **Stato: `enabled: false` invariato.**
 
+### Terza correzione prima del flip (2026-10-04): due sezioni di shortlist, soglia trascurabile, tetto riportato a 60
+
+Tre difetti trovati leggendo l'output di un run reale, non il codice. Tutti e tre chiusi **prima** del flip, con `enabled: false` invariato.
+
+**1. `min_signals` buttava via i segnali piu' puri del run.** Nella finestra reale sei ticker a `+45` (fra cui **CLPR**, un insider che compra il 100% della propria posizione) restavano fuori dalla shortlist solo perche' nessuna seconda fonte li confermava: `min_signals` li trattava come rumore, e non sono rumore, sono **non confermati**, che e' un'informazione diversa. La shortlist ora ha due sezioni che non si mescolano:
+
+- **Convergenza multipla** (`copertura >= min_signals: 2`), tetto `shortlist_size: 25`
+- **Convinzione forte a fonte singola** (`copertura 1` e `score >= single_source_min: 40`), tetto `single_source_limit: 10`
+
+Non si accostano in un ranking unico perche' un `+55` a fonte singola e un `+35` a due moduli non sono confrontabili, e metterli in fila farebbe sembrare il primo piu' convincente del secondo quando e' il dato piu' fragile. `single_source_min: 40` sta nel vuoto naturale della finestra: sotto c'era 39, sopra 45. Ogni ticker della sezione 2 porta in `signals.description` l'etichetta `segnale da una sola fonte, nessuna conferma incrociata`, cosi' la Fase 7 le separa con una query senza ricalcolare nulla. Se `single_source_min` manca, la sezione e' **disabilitata** (comportamento di prima) e la `note` lo dichiara: non ha default `0`, perche' con soglia 0 ogni ticker a un solo modulo entrerebbe in shortlist.
+
+**2. La banda bassa rispondeva a "quanto", non a "qualcosa".** AFL vendeva lo **0.018%** della propria posizione e prendeva `-14.0`, identico a una vendita vera e piccola. Aggiunta una banda con **tetto** (`lt` invece di `gte`), valutata prima di tutte le altre:
+
+```yaml
+frac_buy:  [{lt: 0.01, mult: 0.15}, {gte: 0.50, mult: 1.6}, ...]
+frac_sell: [{lt: 0.01, mult: 0.15}, {gte: 0.50, mult: 1.6}, ...]
+```
+
+- **1% e non 2%**: ABEO (1.5%) e' una vendita reale e piccola; a 2% finirebbe insieme ad AFL e la distinzione che si voleva conservare sparirebbe.
+- **simmetrica** su acquisti e vendite: comprare lo 0.5% della propria posizione non dimostra convinzione nemmeno se costa 33.7M (CRBG `+21.0 -> +4.5`).
+- il tetto e' **stretto**: sotto l'1% prende 0.15, esattamente l'1% resta sulla banda normale.
+- la `description` lo dichiara (`trascurabile: sotto la soglia minima di quota`): un peso piccolo senza spiegazione e' indistinguibile da un errore di calcolo.
+- una banda `lt` **deve essere la prima voce**: sotto la soglia di un tetto precedente la successiva non viene mai valutata, quindi una config che sembra funzionare e non fa niente e' il caso peggiore. Il modulo lo segnala in `errors[]`.
+
+**3. `max_abs: 45` era troppo basso e tagliava solo dal lato dei compratori.** Con 45 sparivano **sei acquisti reali** (XENE, ADRX a 55.2 naturale; PRTA, GPUS, CLPR, BBD a 48.0), per clippare contributi che erano segnali veri senza che nulla lo dichiarasse. Le vendite reali non raggiungevano mai il tetto (massimo osservato 36.8, teorico 43.2): il limite mordeva da una parte sola. Ora `max_abs: 60`, che taglia ancora il caso teorico (30 x 1.6 x 1.35 = 64.8) e lascia stare i segnali veri.
+
+**Il costo dichiarato della banda simmetrica: KOD esce dai candidati.** Compra 156.7M ma solo lo 0.586% della propria posizione, e il contributo passa da `+21.0` a `+4.5`. E' la scelta "la quota vale il convinzione" applicata senza eccezioni, perche' il valore in dollari assoluto non entra nella formula; accettata esplicitamente, con l'intesa che se in futuro perdere segnali di questo tipo risultasse un problema reale il rimedio sia un **segnale distinto** (una banda in dollari assoluti) e non un altro aggiustamento di peso su questa.
+
+**Anteprima sul DB reale (sola lettura, `mode=ro`, nessuna scrittura):**
+
+- **Sezione 1, 13 voci** (era una shortlist unica di 13): BBD +68.0, KLAC/LRCX/SNPS +35.0, CRWV +32.0, LITE +27.0, CRBG +24.5 (era +41.0), CBRS +19.9, AFL +17.0, ABEO +6.0, BNTX 0.0, BLLN -12.0, P -16.0
+- **Sezione 2, 6 voci**: ADRX +55.2 e XENE +55.2 (che con `max_abs: 45` erano 45.0), CLPR/GPUS/PRTA +48.0, MU +45.0
+- **18 contributi insider** svalutati sotto l'1%: 12 vendite a `-3.0`, 6 acquisti a `+4.5` (fra cui CRBG 33.7M e KOD 156.7M)
+- conflitti: **9 -> 7**, perche' AFL e LITE non superano piu' la soglia di contrasto col loro `-3.0`
+
+- Test: **220** (era 209: 8 sulla banda trascurabile e il tetto assoluto, 4 sulle due sezioni)
+- `data/app.db` **non e' stato toccato**: anteprima calcolata in memoria su connessione `mode=ro`
+- **Stato: `enabled: false` invariato.** Il flip resta un commit separato.
+
 - File creati in Fase 6:
   - `modules/scoring/sources.py` (4 extractor a firma uniforme, tutti "restituiscono solo segnali esistenti": l'assenza non e' uno zero)
   - `modules/scoring/module.py` (pesi da config, finestre per modulo, copertura esplicita, shortlist con tie-breaker deterministici, watchlist `ignore`, isolamento errori per sorgente e per ticker, `_merge_contributions`)
-  - `tests/test_scoring_module.py` (55 test)
+  - `tests/test_scoring_module.py` (66 test)
 - File modificati in Fase 6:
-  - `config.yaml` (sezione `scoring` con **`enabled: false`**, `recalc`, `min_signals`, `shortlist_size`, `windows`, `insider_scale`, `warn_institutional_age_days`, 9 pesi)
+  - `config.yaml` (sezione `scoring` con **`enabled: false`**, `recalc`, `min_signals`, `single_source_min`, `single_source_limit`, `shortlist_size`, `windows`, `insider_scale` con bande `lt`, `warn_institutional_age_days`, 9 pesi)
   - `tests/test_config.py` (scoring presente ma disabilitato, pesi completi con almeno un negativo, finestre per tutti e 4 i moduli, `insider_scale` completo e ordinato, e soprattutto l'asserzione **`max_age_days` assente** da `windows.institutional`: il gate non deve poter tornare indietro senza far fallire un test)
   - `README.md` (sezione "Scoring: come si calcola il punteggio" con tabella pesi, copertura, idempotenza, tracciabilita')
 - Test: **209** complessivi, di cui **55** in `test_scoring_module.py` (14 nuovi sullo scaling insider e la riproducibilita', 4 sull'eta' del deposito 13F)

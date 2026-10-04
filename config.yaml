@@ -44,7 +44,9 @@ modules:
   scoring:
     enabled: false           # FASE 6 — in osservazione locale prima dell'attivazione in produzione
     recalc: false            # false = INSERT OR IGNORE (run ripetuti non riscrivono); true = ricalcola e sovrascrive gli score della stessa data
-    min_signals: 2           # moduli minimi distinti per entrare in shortlist: sotto questo è un punteggio da fonte singola
+    min_signals: 2           # moduli minimi distinti per la shortlist MULTIPLA: sotto questo è un punteggio da fonte singola
+    single_source_min: 40    # soglia di score perché un segnale a fonte singola entri comunque in shortlist, in sezione separata. 40 sta nel vuoto naturale della finestra reale: sotto c'era 39, sopra 45. Serve perché min_signals escludeva i segnali più puri del run (CLPR, insider che compra il 100% della propria posizione)
+    single_source_limit: 10  # tetto alle voci della sezione fonte singola, così non può sommergere la convergenza multipla
     shortlist_size: 25
     conflict_min_weight: 10  # etichetta 'segnali contrastanti' nella riga di sintesi quando un contributo positivo E uno negativo superano questo peso. NON cambia lo score: lo rende onesto. Caso reale CBRS: -20 insider sell e +50 institutional new = +35 pieno ma a meta'.
     warn_institutional_age_days: 150  # NON e' un gate: i 13F vecchi continuano a contribuire, ma se il deposito piu' vecchio usato nel run supera questa eta' la nota del modulo dice che il modulo 13F potrebbe aver smesso di depositare. 150 e non 180 perche' il deadline SEC e' 45gg dalla fine del trimestre: 150 sul deposito = due trimestri mancati
@@ -54,13 +56,13 @@ modules:
       news:      {days: 14, positive_gte: 0.35, negative_lte: -0.35, min_articles: 3}
       institutional: {quarters: 1}
     insider_scale:           # il peso insider NON e' fisso: una vendita del 61% della propria posizione e un taglio dello 0.6% erano entrambi -20. Contributo = peso_base x banda(frazione) x banda(n. insider), limitato a max_abs
-      frac_buy:  [{gte: 0.50, mult: 1.6}, {gte: 0.20, mult: 1.3}, {gte: 0.05, mult: 1.0}, {gte: 0.0, mult: 0.7}]  # acquisto: shares/holdings_after, cioe' la quota della posizione comprata
-      frac_sell: [{gte: 0.50, mult: 1.6}, {gte: 0.20, mult: 1.3}, {gte: 0.05, mult: 1.0}, {gte: 0.0, mult: 0.7}]  # vendita: shares/(shares+holdings_after) = quota venduta; holdings_after=0 e' uscita completa = 1.0
+      frac_buy:  [{lt: 0.01, mult: 0.15}, {gte: 0.50, mult: 1.6}, {gte: 0.20, mult: 1.3}, {gte: 0.05, mult: 1.0}, {gte: 0.0, mult: 0.7}]  # acquisto: shares/holdings_after, cioe' la quota della posizione comprata. La banda 'lt' in testa e' la soglia TRASCURABILE: sotto l'1% non c'e' convinzione, c'e' rumore (AFL vendeva lo 0.018% e prendeva -14.0, il peso di una vendita vera). Va per prima: sotto un tetto precedente la banda successiva non viene mai valutata
+      frac_sell: [{lt: 0.01, mult: 0.15}, {gte: 0.50, mult: 1.6}, {gte: 0.20, mult: 1.3}, {gte: 0.05, mult: 1.0}, {gte: 0.0, mult: 0.7}]  # vendita: shares/(shares+holdings_after) = quota venduta; holdings_after=0 e' uscita completa = 1.0. Banda trascurabile SIMMETRICA con gli acquisti: comprare lo 0.5% della propria posizione non dimostra convinzione nemmeno se costa 33.7M
       by_insider_count: [{gte: 4, mult: 1.35}, {gte: 2, mult: 1.15}, {gte: 1, mult: 1.0}]  # su persone DISTINTE (CBRS: 36 dichiarazioni da 3 insider), non su righe di Form 4
       usd_fallback:          # solo per le dichiarazioni senza holdings_after (2.7% del valore nella finestra reale): si ripiega sul valore in dollari
         buy:  [{gte_usd: 50000000, mult: 1.40}, {gte_usd: 10000000, mult: 1.13}, {gte_usd: 1000000, mult: 0.93}, {gte_usd: 250000, mult: 0.67}, {gte_usd: 0, mult: 0.40}]
         sell: [{gte_usd: 50000000, mult: 1.30}, {gte_usd: 10000000, mult: 1.10}, {gte_usd: 1000000, mult: 0.90}, {gte_usd: 250000, mult: 0.65}, {gte_usd: 0, mult: 0.35}]
-      max_abs: 45            # tetto sul contributo insider assoluto: 30 x 1.6 x 1.35 = 64.8 non e' piu' un segnale, e' il tetto che tiene sotto i +100 dei 4 moduli
+      max_abs: 60            # tetto sul contributo insider assoluto: 30 x 1.6 x 1.35 = 64.8 non e' piu' un segnale, e' il tetto che tiene sotto i +100 dei 4 moduli. Era 45 e tagliava solo acquisti (6 ticker persi, per clippare a 55.2), le vendite reali non ci arrivano mai: il massimo osservato e' 36.8
     weights:                 # nessun peso è hardcoded: ogni regola ha il suo numero qui e la sua spiegazione nel README
       insider_open_market_buy: 30    # P open-market sopra min_value_usd nella finestra: peso BASE, moltiplicato per insider_scale.frac_buy
       insider_open_market_sell: -20  # S open-market sopra soglia: peso BASE, moltiplicato per insider_scale.frac_sell (resta negativo)
