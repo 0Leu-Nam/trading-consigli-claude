@@ -42,7 +42,7 @@ modules:
     filer_cik_filter: ["0001541617", "0002045724", "0001263508"]    # CIK 10 cifre: Altimeter Capital, Situational Awareness LP, Baker Bros. Advisors — ESCLUSIVI: si raccolgono solo questi (filtro server EFTS, vedi README); vuoto = ordine EFTS, primi N
     fill_remaining_with_generic: false  # riempie gli slot liberi con altri filer: default false con whitelist attiva (i fileri estranei non richiesti è stato il bug del run #16); ignorato se filer_cik_filter è vuoto
   scoring:
-    enabled: false           # FASE 6 — in osservazione locale prima dell'attivazione in produzione
+    enabled: true            # FASE 6 — attivata in produzione il 2026-10-04 dopo osservazione locale: 220/220 test verdi e shortlist a due sezioni riletta e approvata sui dati reali
     recalc: false            # false = INSERT OR IGNORE (run ripetuti non riscrivono); true = ricalcola e sovrascrive gli score della stessa data
     min_signals: 2           # moduli minimi distinti per la shortlist MULTIPLA: sotto questo è un punteggio da fonte singola
     single_source_min: 40    # soglia di score perché un segnale a fonte singola entri comunque in shortlist, in sezione separata. 40 sta nel vuoto naturale della finestra reale: sotto c'era 39, sopra 45. Serve perché min_signals escludeva i segnali più puri del run (CLPR, insider che compra il 100% della propria posizione)

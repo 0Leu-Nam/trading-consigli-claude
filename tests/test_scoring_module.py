@@ -55,7 +55,11 @@ INSIDER_SCALE = {
     "max_abs": 60,
 }
 DEFAULT_CONFIG = {
-    "enabled": False,
+    # `enabled` e' il segnale che lo Specchio di config.yaml: il modulo non lo
+    # legge (l'orchestrator filtra i moduli abilitati prima di chiamarlo), ma
+    # qui resta allineato perche' i test leggano la stessa configurazione di
+    # produzione.
+    "enabled": True,
     "recalc": False,
     "min_signals": 2,
     "single_source_min": 40,
@@ -576,6 +580,12 @@ def test_single_source_min_from_config_decides_section_two(ctx_and_conn):
     assert "in shortlist fonte singola=1" in result.note
     assert "SOLO=+30" in result.note
     assert SINGLE_SOURCE_LABEL in composite(conn, "SOLO")["description"]
+
+    # La soglia in note porta gia' il segno nel formato (`>=+20`): aggiungerne
+    # un secondo a mano produceva `>=++20` in un report. Qui si blocca la
+    # doppia soglia sul testo che finisce in tabella e nei log.
+    assert "fonte singola=1 (>=+20)" in result.note
+    assert "++" not in result.note
 
 
 def test_single_source_limit_caps_section_two(ctx_and_conn):

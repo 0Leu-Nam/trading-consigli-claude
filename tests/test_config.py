@@ -10,23 +10,29 @@ def test_default_config_loads_without_keys():
     assert "modules" in conf
     assert "database" in conf
     assert conf["database"]["path"] == "data/app.db"
-    # Fase 5 attivata in produzione. Fase 6 (scoring) esiste ma resta
-    # enabled: false finche' non e' stata osservata in locale: la convenzione
-    # del progetto e' che un modulo nuovo non parte senza verifica.
+    # Fase 5 e Fase 6 attivate in produzione. La convenzione del progetto e'
+    # che un modulo nuovo non parte senza verifica: scoring e' stato tenuto
+    # `enabled: false` fino all'osservazione locale conclusa (220/220 test e
+    # shortlist a due sezioni riletta sui dati reali).
     expected_enabled = {
         "insider_trading",
         "price_screener",
         "news_sentiment",
         "institutional_holdings",
+        "scoring",
     }
     assert all(
         isinstance(item, dict)
         and item.get("enabled") == (key in expected_enabled)
         for key, item in conf["modules"].items()
+    ), (
+        "un modulo atteso disabilitato risulta abilitato, o viceversa: "
+        "l'elenco degli attesi va tenuto allineato a config.yaml"
     )
     assert "scoring" in conf["modules"], "il modulo scoring deve essere in config"
-    assert conf["modules"]["scoring"]["enabled"] is False, (
-        "scoring deve restare disabilitato finche' non e' stato osservato"
+    assert conf["modules"]["scoring"]["enabled"] is True, (
+        "scoring e' attivato in produzione dal 2026-10-04: se questo test torna "
+        "rosso, il flip e' stato annullato senza una decisione esplicita"
     )
 
 
@@ -37,6 +43,7 @@ def test_enabled_modules_returns_all_enabled_modules():
         "price_screener",
         "news_sentiment",
         "institutional_holdings",
+        "scoring",
     ]
 
 
