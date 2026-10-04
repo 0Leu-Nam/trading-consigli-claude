@@ -32,18 +32,42 @@ WINDOWS = {
     "insider": {"days": 7, "min_value_usd": 50_000, "open_market_only": True},
     "price": {"days": 5, "vol_spike_mult": 3.0, "move_5d_pct": 0.10},
     "news": {"days": 14, "positive_gte": 0.35, "negative_lte": -0.35, "min_articles": 3},
-    "institutional": {"quarters": 1, "max_age_days": 120},
+    "institutional": {"quarters": 1},
+}
+# Gli stessi numeri di config.yaml: senza questi la scala insider non avrebbe
+# bande e il contributo cadrebbe sul fallback default del modulo.
+INSIDER_SCALE = {
+    "frac_buy": [{"gte": 0.50, "mult": 1.6}, {"gte": 0.20, "mult": 1.3},
+                 {"gte": 0.05, "mult": 1.0}, {"gte": 0.0, "mult": 0.7}],
+    "frac_sell": [{"gte": 0.50, "mult": 1.6}, {"gte": 0.20, "mult": 1.3},
+                  {"gte": 0.05, "mult": 1.0}, {"gte": 0.0, "mult": 0.7}],
+    "by_insider_count": [{"gte": 4, "mult": 1.35}, {"gte": 2, "mult": 1.15}, {"gte": 1, "mult": 1.0}],
+    "usd_fallback": {
+        "buy": [{"gte_usd": 50_000_000, "mult": 1.40}, {"gte_usd": 10_000_000, "mult": 1.13},
+                {"gte_usd": 1_000_000, "mult": 0.93}, {"gte_usd": 250_000, "mult": 0.67},
+                {"gte_usd": 0, "mult": 0.40}],
+        "sell": [{"gte_usd": 50_000_000, "mult": 1.30}, {"gte_usd": 10_000_000, "mult": 1.10},
+                 {"gte_usd": 1_000_000, "mult": 0.90}, {"gte_usd": 250_000, "mult": 0.65},
+                 {"gte_usd": 0, "mult": 0.35}],
+    },
+    "max_abs": 45,
 }
 DEFAULT_CONFIG = {
     "enabled": False,
     "recalc": False,
     "min_signals": 2,
     "shortlist_size": 25,
+    "warn_institutional_age_days": 150,
     "windows": WINDOWS,
+    "insider_scale": INSIDER_SCALE,
     "weights": WEIGHTS,
 }
 TODAY = date.today()
 LAST_BAR = (TODAY - timedelta(days=2)).isoformat()
+# L'eta' dei 13F si misura sulla data di segnale (l'ultima barra), non su oggi:
+# e' cosi' che la description di uno stesso dataset non cambi da un giorno
+# all'altro. I test sotto calcolano le date di deposito su questo riferimento.
+ANCHOR = date.fromisoformat(LAST_BAR)
 
 
 def _quarter(offset: int) -> str:
@@ -110,26 +134,38 @@ def add_price(conn, company_id, *, date_=None, vol_vs_avg_20=None, abs_return_5d
     conn.commit()
 
 
-def add_insider(conn, company_id, *, kind="P", value=1_000_000, days_ago=1, open_market=1):
+def add_insider(
+    conn, company_id, *, kind="P", value=1_000_000, days_ago=1, open_market=1,
+    shares=100, holdings_after=1_000, insider_name="TEST INSIDER", seq=0,
+):
     """Il filing e' identificato da (accession, row_no): perche' una stessa
     azienda possa avere acquisto E vendita, l'accession include il tipo di
     transazione, altrimenti il secondo INSERT OR IGNORE verrebbe scartato in
-    silenzio e il test passerebbe senza il contributo che crede di avere."""
+    silenzio e il test passerebbe senza il contributo che crede di avere.
+
+    `shares=100` su `holdings_after=1000` e' la quota neutra (10% dellaposizione)
+    e restituisce il peso base: i test che vogliono provare la scala passano
+    esplicitamente shares e holdings_after, quelli che vogliono solo sapere
+    che il modulo ha parlato usano questi default.
+    """
     conn.execute(
         """INSERT OR IGNORE INTO insider_transactions
              (company_id, accession, row_no, filing_date, transaction_date,
               insider_name, transaction_type, shares, price_per_share,
-              value_usd, is_open_market)
-           VALUES (?, ?, 1, ?, ?, 'TEST INSIDER', ?, 1000, 10, ?, ?)
+              value_usd, is_open_market, holdings_after)
+           VALUES (?, ?, 1, ?, ?, ?, ?, ?, 10, ?, ?, ?)
         """,
         (
             company_id,
-            f"{company_id:010d}-{kind}-26-{days_ago:06d}",
+            f"{company_id:010d}-{kind}-{insider_name[:6]}-{days_ago:06d}-{seq:03d}",
             (TODAY - timedelta(days=days_ago)).isoformat(),
             (TODAY - timedelta(days=days_ago)).isoformat(),
+            insider_name,
             kind,
+            shares,
             value,
             open_market,
+            holdings_after,
         ),
     )
     conn.commit()
@@ -152,14 +188,15 @@ def add_news(conn, company_id, scores, *, days_ago=1):
     conn.commit()
 
 
-def add_holding(conn, company_id, *, quarter, filer_cik, cusip, shares, filer_name="TEST FUND"):
+def add_holding(conn, company_id, *, quarter, filer_cik, cusip, shares, filer_name="TEST FUND",
+                filing_date=None):
     conn.execute(
         """INSERT OR IGNORE INTO institutional_holdings
              (company_id, filing_quarter, filing_date, filer_name, filer_cik,
               issuer_name, cusip, shares, value_usd)
            VALUES (?, ?, ?, ?, ?, 'ISSUER', ?, ?, 1000)
         """,
-        (company_id, quarter, f"{quarter[:4]}-08-14", filer_name, filer_cik, cusip, shares),
+        (company_id, quarter, filing_date or f"{quarter[:4]}-08-14", filer_name, filer_cik, cusip, shares),
     )
     conn.commit()
 
@@ -672,22 +709,111 @@ def test_institutional_ignores_exit_position(ctx_and_conn):
     assert all("institutional" not in e for e in result.errors), result.errors
 
 
-def test_stale_institutional_is_not_an_error(ctx_and_conn):
-    """Un 13F vecchio oltre max_age_days non e' un errore e non contribuisce:
-    e' il segnale che semplicemente non c'e' piu'. Se fosse trattato come
-    errore, ogni run dopo 120gg segnalerebbe un problema che non esiste."""
+def test_stale_institutional_still_contributes_with_its_age(ctx_and_conn):
+    """Un 13F vecchio non e' un errore e non viene scartato: e' un fatto vero,
+    solo vecchio, e il gate di freschezza e' stato tolto apposta. Quello che
+    deve cambiare e' la DESCRIPTION, che porta l'eta' del deposito, e la nota
+    del modulo che avvisa quando l'eta' supera la soglia. Se il 13F tornasse
+    un errore, ogni run dopo la soglia segnalerebbe un problema che non
+    esiste; se venisse scartato in silenzio, un modulo 13F fermo non si
+    vedrebbe da nessuna parte."""
     ctx, conn, _path = ctx_and_conn
     cid = add_company(conn, "AAA")
     add_price(conn, cid)
-    add_holding(conn, cid, quarter=PREV_QUARTER, filer_cik="0000000001", cusip="AAA", shares=100)
-    add_holding(conn, cid, quarter=LATEST_QUARTER, filer_cik="0000000001", cusip="AAA", shares=200)
+    add_holding(conn, cid, quarter=PREV_QUARTER, filer_cik="0000000001", cusip="AAA", shares=100,
+                filing_date="2020-01-15")
+    add_holding(conn, cid, quarter=LATEST_QUARTER, filer_cik="0000000001", cusip="AAA", shares=200,
+                filing_date="2020-05-15")
 
-    ctx.module_config["windows"] = {**WINDOWS, "institutional": {"quarters": 1, "max_age_days": 1}}
     result = Module().run(ctx)
     conn.commit()
-    assert contribution_rows(conn, "AAA") == []
-    # l'unico errore e' che BASE non ha segnali: NON c'e' un errore sul 13F
+    assert [r["signal_type"] for r in contribution_rows(conn, "AAA")] == ["institutional_increase"]
+    age = (ANCHOR - date(2020, 5, 15)).days
+    assert "depositato 2020-05-15" in contribution_rows(conn, "AAA")[0]["description"]
+    assert f"~{age}gg fa" in contribution_rows(conn, "AAA")[0]["description"]
+    assert f"deposito piu' vecchio {age}gg" in result.note
+    assert "potrebbe non aver depositato" in result.note
+    # resta un'informazione, non un guasto: niente errori sul 13F
     assert all("institutional" not in e for e in result.errors), result.errors
+
+
+def test_fresh_institutional_has_no_stale_warning(ctx_and_conn):
+    """Il caso normale: deposito recente, il nome dei 13F non deve comparire
+    nella nota. L'avviso che non c'e' quando non serve vale quanto l'avviso
+    che c'e'."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "AAA")
+    add_price(conn, cid)
+    recent = (ANCHOR - timedelta(days=40)).isoformat()
+    add_holding(conn, cid, quarter=PREV_QUARTER, filer_cik="0000000001", cusip="AAA", shares=100,
+                filing_date=recent)
+    add_holding(conn, cid, quarter=LATEST_QUARTER, filer_cik="0000000001", cusip="AAA", shares=200,
+                filing_date=recent)
+
+    result = Module().run(ctx)
+    assert "deposito piu' vecchio 40gg" in result.note
+    assert "potrebbe non aver depositato" not in result.note
+
+
+def test_institutional_age_comes_from_filing_date_not_quarter_end(ctx_and_conn):
+    """Regressione: l'eta' si contava dalla FINE DEL TRIMESTRE e dichiarava
+    ~96gg per una 13F depositata 51 giorni prima. Ora la riga riporta la data
+    di deposito, che e' l'unica che descrive la freschezza del documento.
+    """
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "AAA")
+    add_price(conn, cid)
+    filed = ANCHOR - timedelta(days=51)
+    add_holding(conn, cid, quarter=PREV_QUARTER, filer_cik="0000000001", cusip="AAA", shares=100)
+    add_holding(conn, cid, quarter=LATEST_QUARTER, filer_cik="0000000001", cusip="AAA", shares=200,
+                filing_date=filed.isoformat())
+
+    Module().run(ctx)
+    desc = contribution_rows(conn, "AAA")[0]["description"]
+    assert f"depositato {filed.isoformat()}" in desc
+    assert "~51gg fa" in desc
+
+
+def test_institutional_age_is_per_row(ctx_and_conn):
+    """Lo stesso trimestre arriva con due date di deposito diverse (emendamenti
+    in momenti diversi): l'eta' va letta riga per riga, non calcolata una volta
+    per il trimestre."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "AAA")
+    add_price(conn, cid)
+    primo = (ANCHOR - timedelta(days=51)).isoformat()
+    secondo = (ANCHOR - timedelta(days=54)).isoformat()
+    add_holding(conn, cid, quarter=PREV_QUARTER, filer_cik="0000000001", cusip="AAA", shares=100)
+    add_holding(conn, cid, quarter=LATEST_QUARTER, filer_cik="0000000001", cusip="AAA", shares=200,
+                filing_date=primo)
+    add_holding(conn, cid, quarter=LATEST_QUARTER, filer_cik="0000000002", cusip="BBB", shares=300,
+                filing_date=secondo)
+
+    result = Module().run(ctx)
+    descs = [r["description"] for r in contribution_rows(conn, "AAA")]
+    assert any(primo in d and "~51gg" in d for d in descs), descs
+    assert any(secondo in d and "~54gg" in d for d in descs), descs
+    # la nota prende il massimo: e' l'eta' peggiore che conta
+    assert "deposito piu' vecchio 54gg" in result.note
+
+
+def test_institutional_without_filing_date_says_so(ctx_and_conn):
+    """Se la data di deposito manca non si inventa un'eta': si dichiara che non
+    c'e'. Il peso del segnale e' invariato."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "AAA")
+    add_price(conn, cid)
+    add_holding(conn, cid, quarter=PREV_QUARTER, filer_cik="0000000001", cusip="AAA", shares=100,
+                filing_date=None)
+    add_holding(conn, cid, quarter=LATEST_QUARTER, filer_cik="0000000001", cusip="AAA", shares=200,
+                filing_date=None)
+    conn.execute("UPDATE institutional_holdings SET filing_date = NULL WHERE company_id = ?", (cid,))
+    conn.commit()
+
+    Module().run(ctx)
+    row = contribution_rows(conn, "AAA")[0]
+    assert "data deposito n/d" in row["description"]
+    assert row["magnitude"] == pytest.approx(15.0)
 
 
 def test_institutional_needs_two_quarters(ctx_and_conn):
@@ -844,3 +970,256 @@ def test_conflict_does_not_change_shortlist_score_or_order(ctx_and_conn):
     assert "in shortlist=2" in result.note
     # e l'ordine segue il punteggio, non l'etichetta: ACCO (+50) prima di CBRS
     assert result.note.index("ACCO=+50") < result.note.index("CBRS=+35")
+
+
+# ?? 10. scala del contributo insider (frazione di posizione) ????????????????????
+#
+# I numeri qui sotto non sono arbitrari: sono i casi misurati sul DB di
+# produzione del 2026-10-02, dove un peso fisso non distingueva una vendita del
+# 61% della propria posizione da un taglio dello 0,6%.
+
+
+def insider_weight(conn, ticker):
+    rows = {r["signal_type"]: r for r in contribution_rows(conn, ticker)}
+    return rows["insider_open_market_buy" if "insider_open_market_buy" in rows else "insider_open_market_sell"]
+
+
+def test_insider_small_trade_is_downweighted(ctx_and_conn):
+    """Caso KOD: 156.7M comprati ma 0,6% della posizione (taglio di routine).
+    Con il peso fisso era +30, il massimo possibile per un insider."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "KOD")
+    add_insider(conn, cid, kind="P", value=156_700_000, shares=100, holdings_after=25_000)
+
+    Module().run(ctx)
+    row = insider_weight(conn, "KOD")
+    assert row["magnitude"] == pytest.approx(21.0)     # 30 x 0.7 (banda sotto il 5%)
+    assert "0.4% delle posizioni" in row["description"]
+    assert row["direction"] == 1
+
+
+def test_insider_large_stake_is_amplified(ctx_and_conn):
+    """Caso ADRX: 33.3M, ma 60,7% della posizione. Il peso fisso non lo
+    distingueva da KOD. Qui e' il contributo massimo consentito."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "ADRX")
+    add_insider(conn, cid, kind="P", value=33_300_000, shares=607, holdings_after=1_000)
+
+    Module().run(ctx)
+    row = insider_weight(conn, "ADRX")
+    assert row["magnitude"] == pytest.approx(45.0)     # 30 x 1.6 = 48, limitato a 45
+    assert "60.7% delle posizioni" in row["description"]
+
+
+def test_insider_cap_holds_even_with_many_people(ctx_and_conn):
+    """30 x 1.6 x 1.35 = 64.8 non e' piu' un segnale insider: il tetto esiste
+    perche' i 4 moduli insieme arrivano a +100 e un singolo modulo non puo'
+    dominare il totale."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "BIG")
+    for i in range(4):
+        add_insider(conn, cid, kind="P", value=33_300_000, shares=607, holdings_after=1_000,
+                    insider_name=f"INSIDER {i}", days_ago=i + 1)
+
+    Module().run(ctx)
+    row = insider_weight(conn, "BIG")
+    assert row["magnitude"] == pytest.approx(45.0)
+    assert "4 insider distinti" in row["description"]
+
+
+def test_insider_sell_fraction_uses_shares_over_pre_trade_total(ctx_and_conn):
+    """In vendita la frazione non e' shares/holdings_after ma
+    shares/(shares+holdings_after): `holdings_after` e' la posizione RESIDUA, e
+    un rapporto sbagliato farebbe sembrare minuscola una vendita quasi totale."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "CX")
+    add_insider(conn, cid, kind="S", value=8_900_000, shares=613, holdings_after=387)
+
+    Module().run(ctx)
+    row = insider_weight(conn, "CX")
+    assert row["magnitude"] == pytest.approx(-32.0)    # -20 x 1.6
+    assert row["direction"] == -1
+    assert "61.3% delle posizioni" in row["description"]
+
+
+def test_insider_full_exit_is_the_strongest_sell(ctx_and_conn):
+    """`holdings_after = 0` e' l'uscita completa, non un dato mancante: e' la
+    vendita piu' forte possibile e il peso piu' alto della banda. Se venisse
+    trattata come NULL cadrebbe sul fallback per importo, cioe' il caso piu'
+    forte pesato come il piu' debole."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "FULL")
+    add_insider(conn, cid, kind="S", value=1_000_000, shares=1_000, holdings_after=0)
+
+    Module().run(ctx)
+    row = insider_weight(conn, "FULL")
+    assert row["magnitude"] == pytest.approx(-32.0)
+    assert "100.0% delle posizioni" in row["description"]
+    assert "frazione n/d" not in row["description"]
+
+
+def test_insider_fraction_is_weighted_by_value(ctx_and_conn):
+    """La media e' pesata per valore: un ritaglio minuscolo da 90M non puo'
+    contare quanto un'uscita completa da 1M. La media semplice dei due
+    rapporti darebbe 10,5% (banda piena, -20)."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "MIX")
+    add_insider(conn, cid, kind="S", value=1_000_000, shares=100, holdings_after=900,
+                insider_name="PICCOLA", days_ago=1)
+    add_insider(conn, cid, kind="S", value=90_000_000, shares=100, holdings_after=19_900,
+                insider_name="GRANDE", days_ago=2)
+
+    Module().run(ctx)
+    row = insider_weight(conn, "MIX")
+    # (1M x 10.0% + 90M x 0.5%) / 91M = 0.6% -> banda sotto il 5%;
+    # due persone distinte aggiungono il fattore 1.15
+    assert row["magnitude"] == pytest.approx(-16.1)     # -20 x 0.7 x 1.15
+    assert "0.6% delle posizioni" in row["description"]
+
+
+def test_insider_counts_distinct_people_not_rows(ctx_and_conn):
+    """Caso CBRS reale: 36 dichiarazioni di Form 4 da 3 persone. Contando le
+    righe, 36 insider avrebbero fatto scattare la banda massima; sono 3."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "CBRS")
+    for i in range(36):
+        add_insider(conn, cid, kind="S", value=2_400_000, shares=100, holdings_after=900,
+                    insider_name=f"DIRIGENTE {i % 3}", days_ago=i % 6 + 1, seq=i)
+
+    Module().run(ctx)
+    row = insider_weight(conn, "CBRS")
+    assert "3 insider distinti su 36 dichiarazioni" in row["description"]
+    assert row["magnitude"] == pytest.approx(-23.0)    # -20 x 1.15 (banda 2-3 persone)
+
+
+def test_insider_count_bands_are_read_from_config(ctx_and_conn):
+    """Una persona = 1.0, due = 1.15, quattro = 1.35: la differenza fra un
+    singolo direttore e un nucleo di gestori che agiscono insieme."""
+    ctx, conn, _path = ctx_and_conn
+    for n, atteso in ((1, -20.0), (2, -23.0), (4, -27.0)):
+        cid = add_company(conn, f"N{n}")
+        for i in range(n):
+            add_insider(conn, cid, kind="S", value=1_000_000, shares=100, holdings_after=900,
+                        insider_name=f"DIR {n}-{i}", days_ago=i + 1)
+    Module().run(ctx)
+    for n, atteso in ((1, -20.0), (2, -23.0), (4, -27.0)):
+        assert insider_weight(conn, f"N{n}")["magnitude"] == pytest.approx(atteso)
+
+
+def test_insider_without_holdings_after_falls_back_to_value(ctx_and_conn):
+    """Manca `holdings_after`: la frazione non e' calcolabile e il peso si prende
+    dal valore in dollari. La description deve DIRLO, altrimenti sembrerebbe un
+    segnale sulla quota di posizione quando la quota non e' mai stata calcolata.
+    Caso reale: CBRS a 101K e a 87.7M erano entrambi -20."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "NOPCT")
+    add_insider(conn, cid, kind="S", value=87_700_000, shares=None, holdings_after=None)
+
+    Module().run(ctx)
+    row = insider_weight(conn, "NOPCT")
+    assert "frazione n/d (peso per valore)" in row["description"]
+    assert row["magnitude"] == pytest.approx(-26.0)    # -20 x 1.30 (banda >= 50M)
+
+
+def test_insider_fraction_coverage_is_declared(ctx_and_conn):
+    """Se solo una parte del valore ha `holdings_after`, la frazione e' su quel
+    sottoinsieme e la description dice quale: 8 dichiarazioni su 9 nel caso
+    reale, quindi la quota e' comunque un'approssazione."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "PARZ")
+    add_insider(conn, cid, kind="S", value=8_100_000, shares=810, holdings_after=90,
+                insider_name="CON DATI", days_ago=1)
+    add_insider(conn, cid, kind="S", value=900_000, shares=None, holdings_after=None,
+                insider_name="SENZA DATI", days_ago=2)
+
+    Module().run(ctx)
+    desc = insider_weight(conn, "PARZ")["description"]
+    assert "90.0% delle posizioni" in desc
+    assert "su 90% del valore" in desc
+
+
+def test_insider_bands_come_from_config(ctx_and_conn):
+    """I pesi non sono scritti nel codice: cambiando la banda in config cambia
+    il contributo."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "CFG")
+    add_insider(conn, cid, kind="P", value=156_700_000, shares=100, holdings_after=25_000)
+
+    ctx.module_config["insider_scale"] = {
+        **INSIDER_SCALE,
+        "frac_buy": [{"gte": 0.0, "mult": 0.5}],
+    }
+    Module().run(ctx)
+    assert insider_weight(conn, "CFG")["magnitude"] == pytest.approx(15.0)   # 30 x 0.5
+
+
+def test_broken_insider_band_is_reported_not_silent(ctx_and_conn):
+    """Una banda malformata in config deve finire in errors[] con il nome della
+    chiave: se il modulo lo ignora e restituisce zero contributi, il run sembra
+    riuscito e il modulo insider sparisce senza dire niente."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "BAD")
+    add_insider(conn, cid, kind="P", value=1_000_000)
+    ctx.module_config["insider_scale"] = {**INSIDER_SCALE, "frac_buy": [{"gte": 0.5}]}
+
+    result = Module().run(ctx)
+    assert any("insider_trading" in e and "banda non valida" in e for e in result.errors), result.errors
+    assert "insider_open_market_buy" not in [r["signal_type"] for r in contribution_rows(conn, "BAD")]
+
+
+def test_same_dataset_produces_the_same_rows_twice(ctx_and_conn):
+    """Regressione sulla riproducibilita'. Con le finestre ancorate a
+    date('now') due run a poche ore di distanza sullo stesso identico dataset
+    davano risultati diversi (misurato: un ticker entrava ed usciva dalla
+    shortlist e la riga vecchia restava perche' INSERT OR IGNORE non la
+    riscriveva). Il risultato deve essere funzione del DB, non dell'orologio."""
+    ctx, conn, _path = ctx_and_conn
+    for ticker, kind, age in (("AAA", "P", 1), ("BBB", "S", 3), ("CCC", "P", 6)):
+        cid = add_company(conn, ticker)
+        add_price(conn, cid)
+        add_insider(conn, cid, kind=kind, value=40_000_000, shares=100, holdings_after=1_000,
+                    days_ago=age)
+        add_news(conn, cid, [0.9, 0.5, 0.2], days_ago=age)
+    add_holding(conn, 1, quarter=PREV_QUARTER, filer_cik="0000000001", cusip="AAA", shares=10)
+    add_holding(conn, 1, quarter=LATEST_QUARTER, filer_cik="0000000001", cusip="AAA", shares=20)
+
+    Module().run(ctx)
+    conn.commit()
+    prima = [(r["signal_type"], r["magnitude"], r["direction"], r["description"])
+             for r in conn.execute(
+                 "SELECT signal_type, magnitude, direction, description FROM signals"
+                 " WHERE module_key = 'scoring' ORDER BY company_id, signal_type").fetchall()]
+    Module().run(ctx)
+    conn.commit()
+    dopo = [(r["signal_type"], r["magnitude"], r["direction"], r["description"])
+            for r in conn.execute(
+                "SELECT signal_type, magnitude, direction, description FROM signals"
+                " WHERE module_key = 'scoring' ORDER BY company_id, signal_type").fetchall()]
+    assert prima == dopo
+    assert len(prima) > 0
+
+
+def test_news_window_compares_datetimes_not_strings(ctx_and_conn):
+    """`published_at` e' ISO con 'T' e offset, mentre `datetime()` produce
+    'YYYY-MM-DD HH:MM:SS': confrontarle a parole funziona finche' le date
+    differiscono, ma sullo stesso giorno 'T' > ' ' e un articolo delle 00:30
+    entrava in una finestra che si chiudeva alle 12:00 dello stesso giorno.
+    L'articolo di sotto e' 11 ore fuori finestra e porta un sentiment forte: se
+    entrasse, la media dei 4 articoli sarebbe 0.0 e il segnale sparirebbe."""
+    ctx, conn, _path = ctx_and_conn
+    cid = add_company(conn, "AAA")
+    add_news(conn, cid, [0.9, 0.9, 0.9], days_ago=0)
+    soglia = TODAY - timedelta(days=14)
+    conn.execute(
+        "INSERT INTO news_events (company_id, uuid, published_at, title, sentiment_score)"
+        " VALUES (?, 'fuori-finestra', ?, 'fuori finestra', -0.9)",
+        (cid, f"{soglia.isoformat()}T00:30:00+00:00"),
+    )
+    conn.commit()
+
+    Module().run(ctx)
+    rows = [r for r in contribution_rows(conn, "AAA") if r["module_key"] == "news_sentiment"]
+    assert [r["signal_type"] for r in rows] == ["news_sentiment_positive"], [
+        r["description"] for r in rows
+    ]
+    assert "su 3 articoli" in rows[0]["description"]

@@ -124,7 +124,16 @@ manuale qui sopra è la via prevista.
 ## Scoring: come si calcola il punteggio (Fase 6)
 
 Il modulo `scoring` non raccoglie dati: legge le tabelle degli altri 4 moduli e
-combin i segnali in un punteggio per ticker, scritto in `signals`.
+combina i segnali in un punteggio per ticker, scritto in `signals`.
+
+Due regole valide per tutto il capitolo:
+
+1. **ogni finestra è ancorata alla data massima della propria tabella sorgente**,
+   non all'orologio di sistema: la stessa copia del DB produce la stessa
+   shortlist in qualsiasi momento;
+2. **ogni peso è proporzionato alla dimensione dell'evento**, non fisso: un peso
+   che non distingue un taglio di routine da una vendita di metà posizione non
+   distingue niente.
 
 ### Dove finiscono i numeri
 
@@ -134,8 +143,8 @@ Nessun numero è nel codice: cambiando un peso lanciando il run cambia lo score
 
 | peso | cosa lo genera | cosa NON significa |
 |---|---|---|
-| `insider_open_market_buy` +30 | `transaction_type = 'P'`, `is_open_market = 1`, sopra `min_value_usd` nella finestra | non è un giudizio sull'azienda: è un segnale sul fatto che qualcuno ha comprato per conto proprio |
-| `insider_open_market_sell` −20 | `transaction_type = 'S'` open-market sopra soglia | i tipi `M`, `F`, `A`, `C`, `D`, `G` non sono mappati: sono esercizi di opzioni, assegnazioni e donazioni, non convinzione |
+| `insider_open_market_buy` +30 (base) | `transaction_type = 'P'`, `is_open_market = 1`, sopra `min_value_usd` nella finestra, **moltiplicato per `insider_scale`** | non è un giudizio sull'azienda: è un segnale sul fatto che qualcuno ha comprato per conto proprio |
+| `insider_open_market_sell` −20 (base) | `transaction_type = 'S'` open-market sopra soglia, moltiplicato per `insider_scale` | i tipi `M`, `F`, `A`, `C`, `D`, `G` non sono mappati: sono esercizi di opzioni, assegnazioni e donazioni, non convinzione |
 | `price_volume_spike` +15 | `vol_vs_avg_20 >= vol_spike_mult` | è **volume**, non direzione del prezzo: uno spike può essere su un rialzo o su un crollo |
 | `price_move_up` +10 | rendimento a 5 giorni `>= move_5d_pct`, col segno | la colonna `abs_return_5d` contiene il rendimento con segno (misurato: min −0.85, max +1.74). Un ribasso non genera contributo positivo: da solo, un −30% e un +30% hanno lo stesso valore assoluto e significati opposti |
 | `news_sentiment_positive` +20 | media del sentiment `>= positive_gte` su almeno `min_articles` articoli | `min_articles` serve perché il sentiment è rumore: 711 articoli su 1082 sono `neutral` e la media di un solo titolo (+1.0) è più estrema di una diffusa (+0.2) |
@@ -143,6 +152,89 @@ Nessun numero è nel codice: cambiando un peso lanciando il run cambia lo score
 | `institutional_new_position` +25 | posizione aperta nel trimestre da un gestore in `filer_cik_filter` | il 13F ha 45–90 giorni di lag: conferma una convinzione passata, non anticipa un movimento |
 | `institutional_increase` +15 | azioni aumentate rispetto al trimestre precedente | una posizione chiusa non genera contributo: la sua assenza è rumore, non una decisione di vendita |
 | `institutional_multiple` +5 | due o più gestori whitelistati che aprono o aumentano la stessa posizione | |
+
+### Il peso insider è proporzionato, non fisso
+
+I due pesi insider sono **base**, non il valore finale. Il contributo è
+
+```
+peso_base × banda(frazione di posizione) × banda(numero di insider distinti)
+```
+
+limitato da `insider_scale.max_abs`. Serve perché un peso fisso non
+distingue due eventi opposti. Misurato sul DB reale:
+
+| ticker | operazione | valore | insider distinti | frazione di posizione | prima | dopo |
+|---|---|---|---|---|---|---|
+| KOD | acquisto | 156.7M | 1 | 0.6% | +30 | **+21** |
+| ADRX | acquisto | 33.3M | 3 | 60.7% | +30 | **+45** |
+| MPWR | vendita | 40.3M | 1 | 0.8% | −20 | **−14** |
+| CX | vendita | 8.9M | 1 | 61.3% | −20 | **−32** |
+| ABEO | vendita | 101K | 1 | n/d | −20 | **−7** |
+
+Un taglio di routine dello 0.6% della propria posizione e una vendita del 61%
+di quella posizione avevano lo stesso peso.
+
+La frazione di posizione è media **pesata per valore**:
+- acquisto: `shares / holdings_after` (quota comprata);
+- vendita: `shares / (shares + holdings_after)` (quota vendita), perché
+  `holdings_after` è la posizione **residua**;
+- `holdings_after = 0` è l'uscita completa, non un dato mancante: è il peso più
+  alto della banda.
+
+Le dichiarazioni senza `holdings_after` (2.7% del valore nella finestra reale)
+escono dal denominatore e il peso cade sulle bande `usd_fallback`, per valore.
+La description lo dichiara: una frazione dichiarata che copre il 90% del valore
+scrive `su 90% del valore`.
+
+Il numero di insider è **`COUNT(DISTINCT insider_name)`**: CBRS ha 45
+dichiarazioni di Form 4 da 4 persone, e contare le righe avrebbe detto che 45
+persone hanno venduto.
+
+### Ogni finestra è dichiarata
+
+`windows` in config, per modulo: `insider` 7 giorni, `news` 14, `price` 5,
+`institutional` un trimestre. L'istituzionale è trimestrale: paragonarlo a una
+finestra settimanale premieria posizioni vecchie come se fossero notizie.
+
+**Ogni finestra è ancorata alla data massima della propria tabella sorgente**,
+non a `date('now')`. Con l'orologio di sistema la stessa finestra dava risultati
+diversi a poche ore di distanza sullo stesso identico dataset (misurato: un
+ticker entrava e usciva dalla shortlist, e `INSERT OR IGNORE` conservava la riga
+vecchia, così la riga letta non era quella che il codice avrebbe prodotto).
+Ancorando alla tabella, il risultato è funzione del contenuto del DB: la stessa
+copia produce la stessa shortlist in qualsiasi momento.
+
+Il confronto delle date usa `datetime(published_at)`, non il confronto di
+stringhe: `published_at` è ISO-8601 con `T` e offset (`...T09:00:00+00:00`)
+mentre `datetime()` produce `YYYY-MM-DD HH:MM:SS`, e a parole (`T` > ` `) un
+articolo delle 00:30 entrava in una finestra chiusa alle 12:00 dello stesso
+giorno.
+
+### Il 13F vecchio non è un errore, e non viene scartato
+
+L'istituzionale **non ha un gate di freschezza**. Un 13F vecchio resta
+un'informazione vera sul gestore, solo vecchia: scartarla nasconderebbe il
+fatto che il modulo non sta depositando, che è esattamente ciò che serve vedere.
+
+L'età che finisce nella description è quella del **deposito**
+(`filing_date`), non quella della chiusura del trimestre:
+
+```
+13F 2026Q2 depositato 2026-08-14, ~51gg fa
+```
+
+La versione precedente contava i giorni dalla fine del trimestre e dichiarava
+`~96gg fa` per lo stesso documento. L'età è letta **riga per riga** perché lo
+stesso trimestre arriva con date di deposito diverse (emendamenti in momenti
+diversi).
+
+La soglia `warn_institutional_age_days` (150) non filtra niente: se l'età del
+deposito più vecchio usato nel run la supera, la **nota del modulo** dice che il
+modulo 13F potrebbe non aver depositato. Va in `note` e non in `errors` perché
+un dato in ritardo non è un fallimento: un run che segnala errori perché una
+fonte è in ritardo finisce con `partial_error_threshold` e sembra rotto quando
+funziona.
 
 Il segnale istituzionale è calcolato qui e non letto da
 `institutional_holdings.shares_delta`: quella colonna è NULL su tutto il DB,
@@ -169,25 +261,14 @@ leggere la copertura, ed è per questo che è scritta nella riga.
 una sola fonte. **La riga resta in tabella**: la shortlist è un filtro di
 lettura, non di scrittura.
 
-### Ogni finestra è dichiarata
-
-`windows` in config, per modulo: `insider` 7 giorni, `news` 14, `price` 5,
-`institutional` un trimestre con `max_age_days`. L'istituzionale è
-trimestrale: paragonarlo a una finestra settimanale premieria posizioni
-vecchie come se fossero notizie. Un 13F più vecchio di `max_age_days` non
-contribuisce e **non è un errore**: è il segnale che non c'è più.
-
-L'età del dato finisce nella description della riga, così in dashboard è
-visibile che quel segnale ha 45+ giorni.
-
 ### Come è tracciabile
 
 Nessuna migrazione di schema: si riusa il vincolo
 `UNIQUE (company_id, module_key, signal_type, signal_date)` già presente.
 
 - **una riga per contributo**, con il suo peso e il perché:
-  `insider_open_market_buy`, `magnitude=30`,
-  `description="acquisto open-market 27.5M da 2 insider"`
+  `insider_open_market_buy`, `magnitude=45`,
+  `description="acquisto open-market 33.3M da 3 insider distinti su 7 dichiarazioni, 60.7% delle posizioni"`
 - **una riga di sintesi** per ticker: `module_key='scoring'`,
   `signal_type='composite'`, `magnitude` = totale, `description` = riepilogo
   dei contributi e della copertura.
@@ -223,28 +304,35 @@ Se un ticker ha **contributi positivi e negativi entrambi sopra
 `conflict_min_weight`** (default 10), la riga di sintesi lo dichiara:
 
 ```
-CBRS +35.0  score +35.0 da 3 contributi, copertura 2/4
+CBRS +19.9  score +19.9 da 3 contributi, copertura 2/4
             (insider_trading,institutional_holdings);
             segnali contrastanti: + institutional_new_position vs - insider_open_market_sell
 ```
 
-Il caso reale: 36 insider in vendita open-market per 87.7M (`-20`) e una nuova
-posizione di Altimeter (`+25 +25`, piu' `+5` multi-gestore) totalizzano un
-`+35` che sembrava pieno. Metà dei contributi tirava dalla parte opposta e
+Il caso reale: vendite open-market per 112.8M da 4 persone distinti (`-35`) e una
+nuova posizione di Altimeter (`+25 +25`, più `+5` multi-gestore) totalizzano un
+`+19.9` che sembrava pieno. Metà dei contributi tirava dalla parte opposta e
 niente nel numero lo diceva.
 
 **Il punteggio non cambia e la vendita non è bloccata**: `insider_open_market_sell`
-resta un peso negativo normale da -20. Quello che cambia è che il conflitto è
-dichiarato dove si legge il risultato. La ragione è che uno `+35` costruito
-con due fonti d'accordo e uno `+35` costruito annullando un disaccordo non
-sono lo stesso segnale, e la loro somma numerica è identica.
+resta un peso negativo normale (da `-20` a `-32` secondo la quota vendita). Quello
+che cambia è che il conflitto è dichiarato dove si legge il risultato. La ragione
+è che uno `+35` costruito con due fonti d'accordo e uno `+35` costruito annullando
+un disaccordo non sono lo stesso segnale, e la loro somma numerica è identica.
 
 La soglia serve a non dichiarare conflitto il rumore: `institutional_multiple`
 da `+5` contro una vendita da `-20` non è un disaccordo fra due fonti, e senza
 soglia l'etichetta finirebbe su quasi tutti i ticker con più di due moduli.
 `note` riporta anche il conteggio dei ticker con conflitto, così è visibile
-prima di aprire le righe: nel run del 2026-10-03 erano 6 su 145, di cui 2 in
-shortlist (CBRS e CRWV).
+prima di aprire le righe: nel probe del 2026-10-04 erano **9 su 174**, di cui
+**8 in shortlist** (ABEO, AFL, BLLN, BNTX, CBRS, CRWV, LITE, P); il nono è
+`CX`, che non arriva in shortlist.
+
+La soglia è calibrata anche rispetto alla scala insider. Una vendita con
+frazione di posizione nota non può scendere sotto `-20 × 0.7 × 1.0 = -14.0`,
+quindi resta sempre sopra soglia; l'unico caso che può finire sotto è la
+vendita senza `holdings_after`, che segue le bande `usd_fallback` e può
+arrivare a `-7.0`.
 
 ### watchlist
 

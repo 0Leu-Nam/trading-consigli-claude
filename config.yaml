@@ -47,14 +47,23 @@ modules:
     min_signals: 2           # moduli minimi distinti per entrare in shortlist: sotto questo è un punteggio da fonte singola
     shortlist_size: 25
     conflict_min_weight: 10  # etichetta 'segnali contrastanti' nella riga di sintesi quando un contributo positivo E uno negativo superano questo peso. NON cambia lo score: lo rende onesto. Caso reale CBRS: -20 insider sell e +50 institutional new = +35 pieno ma a meta'.
-    windows:                 # ogni modulo ha la sua finestra: il 13F è trimestrale con 45-90gg di lag, non ha senso paragonarlo a una finestra settimanale
+    warn_institutional_age_days: 150  # NON e' un gate: i 13F vecchi continuano a contribuire, ma se il deposito piu' vecchio usato nel run supera questa eta' la nota del modulo dice che il modulo 13F potrebbe aver smesso di depositare. 150 e non 180 perche' il deadline SEC e' 45gg dalla fine del trimestre: 150 sul deposito = due trimestri mancati
+    windows:                 # ogni modulo ha la sua finestra: il 13F è trimestrale con 45-90gg di lag, non ha senso paragonarlo a una finestra settimanale. Ogni finestra è ancorata alla data massima della PROPRIA tabella sorgente, non a date('now'): con l'orologio la stessa finestra dava risultati diversi a poche ore di distanza sullo stesso dataset
       insider:   {days: 7, min_value_usd: 50000, open_market_only: true}
       price:     {days: 5, vol_spike_mult: 3.0, move_5d_pct: 0.10}
       news:      {days: 14, positive_gte: 0.35, negative_lte: -0.35, min_articles: 3}
-      institutional: {quarters: 1, max_age_days: 120}
+      institutional: {quarters: 1}
+    insider_scale:           # il peso insider NON e' fisso: una vendita del 61% della propria posizione e un taglio dello 0.6% erano entrambi -20. Contributo = peso_base x banda(frazione) x banda(n. insider), limitato a max_abs
+      frac_buy:  [{gte: 0.50, mult: 1.6}, {gte: 0.20, mult: 1.3}, {gte: 0.05, mult: 1.0}, {gte: 0.0, mult: 0.7}]  # acquisto: shares/holdings_after, cioe' la quota della posizione comprata
+      frac_sell: [{gte: 0.50, mult: 1.6}, {gte: 0.20, mult: 1.3}, {gte: 0.05, mult: 1.0}, {gte: 0.0, mult: 0.7}]  # vendita: shares/(shares+holdings_after) = quota venduta; holdings_after=0 e' uscita completa = 1.0
+      by_insider_count: [{gte: 4, mult: 1.35}, {gte: 2, mult: 1.15}, {gte: 1, mult: 1.0}]  # su persone DISTINTE (CBRS: 36 dichiarazioni da 3 insider), non su righe di Form 4
+      usd_fallback:          # solo per le dichiarazioni senza holdings_after (2.7% del valore nella finestra reale): si ripiega sul valore in dollari
+        buy:  [{gte_usd: 50000000, mult: 1.40}, {gte_usd: 10000000, mult: 1.13}, {gte_usd: 1000000, mult: 0.93}, {gte_usd: 250000, mult: 0.67}, {gte_usd: 0, mult: 0.40}]
+        sell: [{gte_usd: 50000000, mult: 1.30}, {gte_usd: 10000000, mult: 1.10}, {gte_usd: 1000000, mult: 0.90}, {gte_usd: 250000, mult: 0.65}, {gte_usd: 0, mult: 0.35}]
+      max_abs: 45            # tetto sul contributo insider assoluto: 30 x 1.6 x 1.35 = 64.8 non e' piu' un segnale, e' il tetto che tiene sotto i +100 dei 4 moduli
     weights:                 # nessun peso è hardcoded: ogni regola ha il suo numero qui e la sua spiegazione nel README
-      insider_open_market_buy: 30    # P open-market sopra min_value_usd nella finestra
-      insider_open_market_sell: -20  # S open-market sopra soglia
+      insider_open_market_buy: 30    # P open-market sopra min_value_usd nella finestra: peso BASE, moltiplicato per insider_scale.frac_buy
+      insider_open_market_sell: -20  # S open-market sopra soglia: peso BASE, moltiplicato per insider_scale.frac_sell (resta negativo)
       price_volume_spike: 15         # vol_vs_avg_20 >= vol_spike_mult (spinta di acquisto, non direzione)
       price_move_up: 10              # rendimento 5gg >= move_5d_pct, col segno: un ribasso non premia
       news_sentiment_positive: 20    # media sentiment >= positive_gte su almeno min_articles articoli

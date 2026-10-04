@@ -14,13 +14,28 @@ Tre scelte strutturali, perche' ognuna evita una classe di errore silenzioso:
 
 2. **Ogni modulo ha la sua finestra.** L'istituzionale e' trimestrale con 45-90
    giorni di lag strutturale: paragonarlo a una finestra settimanale premieria
-   posizioni vecchie come se fossero notizie. `windows.institutional` ha il suo
-   `max_age_days`, e l'eta' del dato finisce nella description.
+   posizioni vecchie come se fossero notizie. L'eta' del dato (quella del
+   deposito) finisce nella description, e **non c'e' un gate di freschezza**:
+   un 13F vecchio e' un'informazione vera, e scartarla nasconderebbe il fatto
+   che il modulo 13F ha smesso di depositare.
 
-3. **Il punteggio e' tracciabile riga per riga.** Ogni contributo genera una
+3. **Ogni finestra e' ancorata alla tabella, non all'orologio.** Ogni finestra
+   parte dal massimo della propria tabella sorgente (`MAX(filing_date)`,
+   `MAX(date)`, `MAX(published_at)`), cosi' la stessa copia del DB produce la
+   stessa shortlist in qualsiasi momento. Con `date('now')` la finestra si
+   spostava da sola durante il giorno e la riga letta in tabella poteva non
+   essere quella che il codice aveva prodotto.
+
+4. **Il punteggio e' tracciabile riga per riga.** Ogni contributo genera una
    riga in `signals` con il suo peso e il perche', piu' una riga di sintesi
    con il totale. La Fase 7 puo' mostrare i dettagli con due query, senza
    parsing di JSON e senza dover ricalcolare nulla.
+
+5. **Il peso misura la dimensione dell'evento.** I pesi insider sono basi, non
+   valori finali: il contributo e' `peso_base x banda(frazione di posizione) x
+   banda(numero di persone distinte)`. Con un peso fisso, un taglio dello 0.6%
+   della propria posizione e una vendita del 61% di quella posizione avevano
+   lo stesso peso (misurato su KOD e CX).
 """
 from __future__ import annotations
 
@@ -61,6 +76,8 @@ class Module(ModuleInterface):
         shortlist_size = int(conf.get("shortlist_size", 25))
         recalc = bool(conf.get("recalc", False))
         conflict_min_weight = int(conf.get("conflict_min_weight", 10))
+        scale = dict(conf.get("insider_scale") or {})
+        warn_inst_age = int(conf.get("warn_institutional_age_days", 150))
 
         if not weights:
             return ModuleResult(
@@ -84,7 +101,9 @@ class Module(ModuleInterface):
 
         errors: list[str] = []
         ignored = self._ignored_tickers(ctx.conn)
-        contributions = self._collect(ctx, weights, windows, errors)
+        contributions, institutional = self._collect(
+            ctx, weights, windows, scale, date.fromisoformat(signal_date), errors
+        )
 
         by_company: dict[int, list[sources.Contribution]] = {}
         for company_id, items in contributions.items():
@@ -181,14 +200,15 @@ class Module(ModuleInterface):
             rows_written=rows_written,
             errors=errors,
             watermark=signal_date,
-            note=self._note(scored, shortlist, errors, ignored),
+            note=self._note(scored, shortlist, errors, ignored, institutional, warn_inst_age),
         )
 
     # ── raccolta ───────────────────────────────────────────────────────────────
 
     def _collect(
-        self, ctx: RunContext, weights: dict, windows: dict, errors: list[str]
-    ) -> dict[int, list[sources.Contribution]]:
+        self, ctx: RunContext, weights: dict, windows: dict, scale: dict,
+        today: date, errors: list[str],
+    ) -> tuple[dict[int, list[sources.Contribution]], sources.InstitutionalResult]:
         """Chiama i 4 extractor e raggruppa per company_id.
 
         Ogni extractor e' isolato: se il modulo insider solleva un errore, gli
@@ -197,18 +217,32 @@ class Module(ModuleInterface):
         la copertura dichiarata nella riga di sintesi non e' confrontabile con
         quella di un run senza errori: e' per questo che l'errore resta in
         errors[] e non viene solo loggato.
+
+        `today` e' la data di segnale, non `date.today()`: e' il riferimento per
+        l'eta' dei 13F, cosi' la description resta riproducibile sullo stesso
+        dataset. Le finestre, invece, ognuna la prende dal massimo della propria
+        tabella sorgente (vedi `sources`): una finestra ancorata all'orologio
+        cambiava la shortlist da sola a poche ore di distanza.
         """
         out: dict[int, list[sources.Contribution]] = {}
+        institutional = sources.InstitutionalResult({})
+        win_ins = windows.get("insider", {})
         spec = (
             (
                 "insider_trading",
                 lambda: sources.insider_signals(
                     ctx.conn,
-                    days=int(windows.get("insider", {}).get("days", 7)),
-                    min_value_usd=int(windows.get("insider", {}).get("min_value_usd", 50_000)),
-                    open_market_only=bool(windows.get("insider", {}).get("open_market_only", True)),
+                    days=int(win_ins.get("days", 7)),
+                    min_value_usd=int(win_ins.get("min_value_usd", 50_000)),
+                    open_market_only=bool(win_ins.get("open_market_only", True)),
                     weights=weights,
                     threshold_types=TRANSACTION_TYPES,
+                    frac_buy=_bands(scale.get("frac_buy")),
+                    frac_sell=_bands(scale.get("frac_sell")),
+                    count_bands=_bands(scale.get("by_insider_count")),
+                    usd_fallback_buy=_bands(scale.get("usd_fallback", {}).get("buy")),
+                    usd_fallback_sell=_bands(scale.get("usd_fallback", {}).get("sell")),
+                    max_abs=float(scale.get("max_abs", 45)),
                 ),
             ),
             (
@@ -237,8 +271,7 @@ class Module(ModuleInterface):
                 lambda: sources.institutional_signals(
                     ctx.conn,
                     quarters_back=int(windows.get("institutional", {}).get("quarters", 1)),
-                    max_age_days=int(windows.get("institutional", {}).get("max_age_days", 120)),
-                    today=date.today(),
+                    today=today,
                     weights=weights,
                 ),
             ),
@@ -250,9 +283,12 @@ class Module(ModuleInterface):
                 errors.append(f"scoring: sorgente {module_key} non valutabile: {exc}")
                 log.warning("scoring: sorgente %s non valutabile: %s", module_key, exc)
                 continue
+            if module_key == "institutional_holdings":
+                institutional = found
+                found = institutional.contributions
             for company_id, contributions in found.items():
                 out.setdefault(company_id, []).extend(contributions)
-        return out
+        return out, institutional
 
     def _ignored_tickers(self, conn) -> set[int]:
         """company_id con status 'ignore' in watchlist. Un ticker ignorato non
@@ -289,7 +325,7 @@ class Module(ModuleInterface):
         return cur.rowcount
 
     @staticmethod
-    def _note(scored, shortlist, errors, ignored) -> str:
+    def _note(scored, shortlist, errors, ignored, institutional, warn_age) -> str:
         ranked = ", ".join(f"{t}={s:+.0f}" for s, _n, t, _c, *_ in shortlist[:5])
         base = (
             f"ticker valutati={len(scored)}, in shortlist={len(shortlist)} "
@@ -306,11 +342,58 @@ class Module(ModuleInterface):
                 + ("..." if len(conflicts) > 5 else "")
                 + ")"
             )
+        base += _institutional_age_note(institutional, warn_age)
         if ranked:
             base += f"; top: {ranked}"
         if errors:
             base += f"; {len(errors)} problemi (vedi errors)"
         return base
+
+
+def _institutional_age_note(institutional, warn_age: int) -> str:
+    """Eta' del 13F piu' vecchio usato nel run: informazione, non blocco.
+
+    Il gate di freschezza e' stato tolto di proposito (vedi
+    `institutional_signals`), quindi il rischio residuo e' uno solo: che il
+    modulo 13F smetta di depositare e che l'ultimo trimestre salvato continui a
+    valere per sempre senza che nessuno se ne accorga. Qui si dice esplicitamente
+    quando l'eta' supera la soglia, cosi' la fermata si vede nel log del run.
+
+    Va in `note` e NON in `errors` per scelta: un dato vecchio non e' un
+    fallimento, e un run che segnala errori perche' una fonte e' in ritardo
+    finisce con `partial_error_threshold` e sembra rotto quando funziona. La
+    soglia e' 150gg e non 180 perche' i 13F si depositano entro 45gg dalla fine
+    del trimestre: 150 giorni sul deposito significa che sono mancati due
+    trimestri di raccolta, non che il dato e' un po' in ritardo.
+    """
+    if institutional.max_deposit_age_days is None:
+        return ""
+    oldest = institutional.max_deposit_age_days
+    quarters = "/".join(institutional.quarters)
+    note = f"; 13F usati {quarters}, deposito piu' vecchio {oldest}gg"
+    if oldest > warn_age:
+        note += f" (> {warn_age}gg: il modulo 13F potrebbe non aver depositato)"
+    return note
+
+
+def _bands(raw) -> sources.Bands:
+    """Da YAML a tuple (soglia, moltiplicatore), nell'ordine in cui sono scritte.
+
+    Le soglie si scendono: la prima che il valore soddisfa vince, e l'ultima
+    voce e' il piano (il valore piu' piccolo possibile ha comunque un peso).
+    `gte_usd` e `gte` sono la stessa chiave con due unita' diverse ( dollari o
+    frazione di posizione), perche' nella config gli importi e le frazioni non
+    possono finire nella stessa lista.
+    """
+    if not raw:
+        return ()
+    bands: sources.Bands = ()
+    for item in raw:
+        threshold = item.get("gte", item.get("gte_usd"))
+        if threshold is None or "mult" not in item:
+            raise ValueError(f"banda non valida {item!r}: servono 'gte' (o 'gte_usd') e 'mult'")
+        bands += ((float(threshold), float(item["mult"])),)
+    return bands
 
 
 def _merge_contributions(items):

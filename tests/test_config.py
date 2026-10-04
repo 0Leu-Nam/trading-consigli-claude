@@ -65,9 +65,59 @@ def test_scoring_weights_are_configured_and_documented():
     # ogni modulo con dati in produzione deve avere una finestra dichiarata
     for module_key in ("insider", "price", "news", "institutional"):
         assert module_key in scoring["windows"], f"finestra mancante per {module_key}"
-    # l'istituzionale e' trimestrale: senza max_age_days il suo peso finirebbe
-    # per essere confrontato con segnale settimanali
-    assert "max_age_days" in scoring["windows"]["institutional"]
+    # l'istituzionale e' trimestrale: il suo peso viene confrontato con segnali
+    # settimanali e per questo non porta un peso proprio
+    assert set(scoring["windows"]["institutional"]) == {"quarters"}, (
+        "la finestra istituzionale deve dichiarare solo 'quarters'"
+    )
+    # NON deve esserci un gate di freschezza: un 13F vecchio resta un'informazione
+    # vera e viene dichiarato con la sua eta' nella description. Se la chiave
+    # tornasse in config, il modulo la ignorerebbe in silenzio e il peso
+    # dell'istituzionale cambierebbe comportamento senza che nessuno lo legga.
+    assert "max_age_days" not in scoring["windows"]["institutional"], (
+        "gate di freschezza riintrodotto: l'eta' va in description, non in condizione"
+    )
+    assert scoring["warn_institutional_age_days"] > 0, "serve una soglia per l'avviso in note"
+
+
+def test_scoring_insider_scale_is_complete_and_ordered():
+    """La scala del contributo insider.
+
+    Le bande devono scendere e l'ultima deve essere il piano: senza una voce che
+    copre il valore minimo, una frazione del 2% resterebbe senza moltiplicatore
+    (o con l'1.0 implicitto, che e' un peso fisso travestito). Uguale per
+    acquisto e vendita, perche' la quota di posizione si misura nello stesso
+    modo nei due casi.
+    """
+    scale = cfg.load_config()["modules"]["scoring"]["insider_scale"]
+    assert set(scale) == {"frac_buy", "frac_sell", "by_insider_count", "usd_fallback", "max_abs"}
+
+    for lato in ("frac_buy", "frac_sell"):
+        bande = scale[lato]
+        assert len(bande) >= 2, f"{lato}: serve almeno una soglia e un piano"
+        soglie = [b["gte"] for b in bande]
+        assert soglie == sorted(soglie, reverse=True), f"{lato}: le soglie devono scendere"
+        assert soglie[-1] <= 0.0, f"{lato}: l'ultima voce e' il piano, deve coprire il minimo"
+        assert all(b.get("mult", 0) > 0 for b in bande), f"{lato}: moltiplicatore mancante"
+
+    conteggio = [b["gte"] for b in scale["by_insider_count"]]
+    assert conteggio[0] >= 4 and conteggio[-1] == 1, "la banda sul numero di persone deve partire da 4 e finire a 1"
+
+    for lato in ("buy", "sell"):
+        fallback = scale["usd_fallback"][lato]
+        assert [b["gte_usd"] for b in fallback] == sorted(
+            (b["gte_usd"] for b in fallback), reverse=True
+        ), f"usd_fallback.{lato}: le soglie devono scendere"
+        assert fallback[-1]["gte_usd"] == 0, f"usd_fallback.{lato}: manca il piano a zero"
+
+    # il tetto assoluto: senza, 30 x 1.6 x 1.35 = 64.8 da un solo modulo e
+    # i 4 moduli insieme arriverebbero ben oltre la scala dei 100 punti
+    assert scale["max_abs"] > 0
+    peggiore = (
+        max(b["mult"] for b in scale["frac_buy"])
+        * max(b["mult"] for b in scale["by_insider_count"])
+    )
+    assert scale["max_abs"] < 30 * peggiore, "il tetto deve tagliare davvero, non essere decorativo"
 
 
 def test_institutional_whitelist_ciks_are_ten_digit_and_unique():
