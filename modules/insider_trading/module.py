@@ -52,8 +52,8 @@ class Module(ModuleInterface):
                 ticker, company_name, company_cik, rows = sec_edgar.parse_form4(
                     xml_bytes, xml_url, filing.accession
                 )
-            except sec_edgar.SecEdgarError as exc:
-                errors.append(f"filing {filing.accession}: {exc}")
+            except Exception as exc:
+                errors.append(f"filing {filing.accession}: {type(exc).__name__}: {exc}")
                 continue
 
             if not ticker:

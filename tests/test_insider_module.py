@@ -112,3 +112,102 @@ def test_module_min_value_filter(tmp_path, monkeypatch):
     conn.commit()
     assert r.rows_written == 0  # 25.5k e 5.2k entrambi sotto soglia
     conn.close()
+
+
+def test_find_and_findall_tolerate_none():
+    assert sec_edgar._find(None, "issuer") is None
+    assert sec_edgar._findall(None, "nonDerivativeTransaction") == []
+
+
+def test_parse_form4_tolerates_missing_fields():
+    """Form 4 con campi assenti lungo la catena: non deve sollevare AttributeError."""
+    removals = {
+        "transactionAmounts": """      <transactionAmounts>
+        <transactionShares><value>1000</value></transactionShares>
+        <transactionPricePerShare><value>25.5</value></transactionPricePerShare>
+      </transactionAmounts>
+""",
+        "postTransactionAmounts": """      <postTransactionAmounts><sharesOwnedFollowingTransaction><value>5000</value></sharesOwnedFollowingTransaction></postTransactionAmounts>
+""",
+        "transactionCoding": """      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+""",
+        "sharesOwnedFollowingTransaction": """<sharesOwnedFollowingTransaction><value>5000</value></sharesOwnedFollowingTransaction>""",
+    }
+    for name, block in removals.items():
+        xml_bytes = SAMPLE_XML.replace(block, "").encode()
+        ticker, company_name, cik, transactions = sec_edgar.parse_form4(xml_bytes, "https://x/o.xml", "ACC-X")
+        assert ticker == "ACME"
+        assert company_name == "ACME CORP"
+        assert isinstance(transactions, list)
+
+
+def test_parse_form4_missing_transaction_coding_skips_row():
+    """Senza transactionCoding la riga viene scartata (non crasha)."""
+    xml_bytes = SAMPLE_XML.replace(
+        "      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>\n", ""
+    ).encode()
+    ticker, _, _, transactions = sec_edgar.parse_form4(xml_bytes, "https://x/o.xml", "ACC-X")
+    assert [t.transaction_type for t in transactions] == ["S"]  # resta solo la seconda
+
+
+def test_parse_form4_missing_amounts_leaves_none_but_keeps_row():
+    xml_bytes = SAMPLE_XML.replace(
+        """      <transactionAmounts>
+        <transactionShares><value>1000</value></transactionShares>
+        <transactionPricePerShare><value>25.5</value></transactionPricePerShare>
+      </transactionAmounts>
+""",
+        "",
+    ).encode()
+    ticker, _, _, transactions = sec_edgar.parse_form4(xml_bytes, "https://x/o.xml", "ACC-X")
+    assert len(transactions) == 2
+    first = next(t for t in transactions if t.shares is None)
+    assert first.transaction_type == "P"
+    assert first.value_usd is None
+
+
+def test_parse_form4_missing_post_amounts_leaves_holdings_none():
+    xml_bytes = SAMPLE_XML.replace(
+        "      <postTransactionAmounts><sharesOwnedFollowingTransaction><value>5000</value></sharesOwnedFollowingTransaction></postTransactionAmounts>\n",
+        "",
+    ).encode()
+    ticker, _, _, transactions = sec_edgar.parse_form4(xml_bytes, "https://x/o.xml", "ACC-X")
+    assert transactions[0].holdings_after is None
+
+
+def test_parse_form4_missing_shares_owned_leaves_holdings_none():
+    """Manca sharesOwnedFollowingTransaction ma resta postTransactionAmounts."""
+    xml_bytes = SAMPLE_XML.replace(
+        "<sharesOwnedFollowingTransaction><value>5000</value></sharesOwnedFollowingTransaction>", ""
+    ).encode()
+    ticker, _, _, transactions = sec_edgar.parse_form4(xml_bytes, "https://x/o.xml", "ACC-X")
+    assert transactions[0].holdings_after is None
+
+
+def test_module_isolates_partial_failure_in_errors(tmp_path, monkeypatch):
+    """Un filing malformato finisce in errors[], non fa fallire l'intero modulo (run -> warning)."""
+    monkeypatch.setattr(sec_edgar, "search_form4", lambda *a, **k: _make_discovery("ACC-OK", "ACC-BAD"))
+
+    def fake_fetch(_user_agent, discovery):
+        return f"https://x/{discovery.accession}.xml"
+
+    def fake_get(url, *a, **k):
+        return _Resp(SAMPLE_XML.encode() if url.endswith("ACC-OK.xml") else b"<ownershipDocument>")
+
+    monkeypatch.setattr(sec_edgar, "fetch_ownership_xml_url", fake_fetch)
+    monkeypatch.setattr(sec_edgar, "_get", fake_get)
+
+    module, ctx, conn, path = _run_module(tmp_path)
+    r = module.run(ctx)
+    conn.commit()
+    assert r.status == "ok"  # il modulo sopravvive: l'errore è parziale
+    assert any("ACC-BAD" in err for err in r.errors)
+    assert r.rows_written == 2  # il filing valido è stato processato
+
+    # lo scheletro dell'orchestratore classifica gli errori parziali come warning
+    from core.orchestrator import classify_run
+
+    from core.module_interface import ModuleResult
+
+    assert classify_run([r]) == "warning"
+    conn.close()

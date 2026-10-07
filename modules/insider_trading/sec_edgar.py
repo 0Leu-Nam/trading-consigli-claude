@@ -171,14 +171,18 @@ def _localname(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def _find(element: ET.Element, name: str) -> Optional[ET.Element]:
+def _find(element: Optional[ET.Element], name: str) -> Optional[ET.Element]:
+    if element is None:
+        return None
     for child in element.iter():
         if _localname(child.tag) == name:
             return child
     return None
 
 
-def _findall(element: ET.Element, name: str) -> list[ET.Element]:
+def _findall(element: Optional[ET.Element], name: str) -> list[ET.Element]:
+    if element is None:
+        return []
     return [child for child in element.iter() if _localname(child.tag) == name]
 
 
