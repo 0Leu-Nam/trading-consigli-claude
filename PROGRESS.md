@@ -1,8 +1,8 @@
 # PROGRESS.md — Registro di continuità tra sessioni
 
 ## Stato attuale
-- Fase in corso: nessuna — Fase 6 chiusa e attivata in produzione il 2026-10-04; prossimo lavoro la Fase 7 (dashboard)
-- Fase 6: 100% — `scoring` **attivata in produzione** (`enabled: true`, 2026-10-04) dopo osservazione locale conclusa: 220/220 test verdi e shortlist a due sezioni riletta e approvata sui dati reali.
+- Fase in corso: **Fase 7 (dashboard)**. 7a (tabellare statica) implementata e producibile in locale; commit 1 fatto, deploy (7b) in attesa delle due impostazioni GitHub.
+- Fase 6: 100% — `scoring` **attivata in produzione** (`enabled: true`, 2026-10-04) dopo osservazione locale conclusa: 220/220 test verdi e shortlist a due sezioni riletta e approvata sui dati reali. Ora 232/232 verdi.
 - Fase 5: 100% — `institutional_holdings` **attivata in produzione** (`enabled: true`, 2026-10-01) con whitelist di 3 gestori.
 - Fase 4: 100% — `news_sentiment` **attivata in produzione** (`enabled: true`, 2026-09-30).
 - Fase 3: 100% — validata in produzione.
@@ -10,6 +10,7 @@
 - Fase 1: 100%.
 
 ## Ultima sessione conclusa
+- **Sessione 2026-10-06 — Fase 7a (dashboard tabellare) implementata, commit 1**: generatore HTML statico in `dashboard/generate.py` (read-only, nessuna dipendenza), subcomando `python -m core.cli dashboard [--date] [--out]`, 12 test nuovi (232/232 verdi), `data/dashboard.html` generata sui dati reali del 2026-10-05 (16 in Sezione 1, 6 in Sezione 2, 163 nel dettaglio "fuori shortlist", 208 contributi grezzi; DB invariato, hash confermato prima/dopo). Decisioni prese dall'utente in sessione: HTML in `data/` + GitHub Pages; contenuti = segnali grezzi + shortlist a due sezioni; i due blocchi dati (`name IS NULL`, punteggi negativi) gestiti **in rendering**, senza toccare i dati; solo 7a, 7b fuori scope. **Convenzione commit**: commit 1 solo con codice+test+docs+pagina, poi l'utente guarda l'HTML; commit 2 = workflow di deploy Pages + istruzioni per le due impostazioni GitHub (Settings → Pages → Source GitHub Actions; variabile `PAGES_ENABLED=true`). Dettagli in "Fase 7".
 - **Sessione 2026-10-04c — FLIP di Fase 6 in produzione**: `scoring.enabled: true` dopo che l'utente ha riletto e approvato la shortlist finale a due sezioni sull'istantanea reale (13 in convergenza multipla, 6 in convinzione forte a fonte singola, 155 esclusi su 174 valutati, 0 ignorati per watchlist). 220/220 verdi. Il commit di flip e' separato da quello delle correzioni, come da convenzione. **Nessuna modifica ai pesi o alle soglie nel flip**: il flip cambia solo la porta, non il metodo. Restano **due affinamenti identificati e NON implementati**, che sono il vero debito tecnico di Fase 6: (1) la copertura conta i **moduli**, quindi un segnale costruito da *due gestori diversi dentro lo stesso modulo* legge "fonte singola" anche se i due gestori sono indipendenti (caso reale MU: `+45` = 25 nuova posizione Altimeter + 15 aumento Situational + 5 multi-gestore, tutti e tre dentro `institutional_holdings`); (2) `single_source_min: 40` e' stato scelto in un **vuoto di 1 punto** (4 ticker a `+39.0` escono per un punto, il primo sopra e' `+45`), quindi va rivisto dopo osservazione prolungata e non aggiustato sotto pressione. Dettagli in "Fase 6".
 - **Sessione 2026-10-04b — shortlist in due sezioni, soglia trascurabile 1%, tetto insider a 60, produzione OFF**: `min_signals` escludeva i segnali piu' puri del run (sei ticker a +45, fra cui CLPR che compra il 100% della sua posizione) perche' erano a fonte singola: ora ci sono due sezioni separate, "convergenza multipla" e "convinzione forte a fonte singola" (`single_source_min: 40`), che non si mescolano in un ranking unico. La banda bassa rispondeva a "quanto ha venduto" ma non a "ha venduto qualcosa" (AFL allo 0.018% pesava come un'uscita vera): aggiunta una banda con tetto `lt: 0.01`, simmetrica su acquisti e vendite, che dichiara il "trascurabile" in description. `max_abs` riportato da 45 a 60: tagliava sei acquisti reali per fermare solo il caso teorico, e le vendite non ci arrivavano mai. 220/220 verdi. 18 contributi svalutati sotto l'1% (fra cui CRBG 33.7M e KOD 156.7M, che con la banda simmetrica esce dai candidati: conseguenza accettata della scelta "quota di posizione, non valore assoluto"). Dettagli in "Fase 6".
 - **Sessione 2026-10-04 — correzioni pre-flip di Fase 6, produzione OFF**: il peso insider non era piu' fisso (un taglio dello 0,6% della posizione e una vendita del 61% avevano lo stesso peso), l'eta' del 13F si contava dalla fine del trimestre invece che dal deposito, il numero di insider contava le righe di Form 4 invece che le persone, e le finestre dipendevano dall'orologio di sistema. 209/209 verdi. La shortlist sul DB reale non cambia di composizione (13 ticker prima e dopo): cambiano i punteggi. Dettagli in "Fase 6".
@@ -312,14 +313,10 @@ Uso corretto in Fase 6: incrociare 13F con insider trading, price screener e new
 
 ## Prossimo step esatto
 1. **Fase 6 e' in produzione dal 2026-10-04.** Il flip e' avvenuto dopo che la shortlist a due sezioni e' stata riletta e approvata sui dati reali, quindi le tre osservazioni che erano la precondizione del flip sono **state soddisfatte**: la copertura e' dichiarata in ogni riga e i primi 13 non sono tutti `copertura 1/4` (sono 2/4 e 3/4), le new position 13F sono state verificate contro il trimestre precedente, e le description insider dichiarano la frazione di posizione con la soglia trascurabile esplicitata.
-2. **Cosa guardare al primo run in produzione**: quante righe scrive, quante ticker con copertura 1/4 finiscono in Sezione 2, e se i 4 ticker a `+39.0` (FTHY, AOMR, CRAFX, MNSO) restano sotto soglia. Se il conteggio righe e' molto diverso dalle 369 della prova in locale, la causa piu' probabile non e' il codice ma una finestra sorgente spostata: va guardato `MAX(data)` di ciascuna tabella.
+2. **Passo per il commit 2 di Fase 7 (deploy)**: dopo che l'utente ha guardato `data/dashboard.html` e approvato, aggiungere al workflow `.github/workflows/pipeline.yml` il job/deploy Pages con gate `if: vars.PAGES_ENABLED == 'true'` (il `GITHUB_TOKEN` non alimenta nessun workflow, quindi il job sta **dentro** `pipeline.yml`, `needs: run`, non in un workflow `push` separato) e dare le due istruzioni GitHub: Settings → Pages → Source **GitHub Actions**; Settings → Actions → Variables → `PAGES_ENABLED=true`. Niente run rosse senza variabile.
 3. **I due affinamenti di Fase 6 restano da fare** (vedi "I due affinamenti identificati e NON implementati al flip"): distinguere *moduli* da *fonti indipendenti* nella copertura (caso MU) e rivedere `single_source_min` sulla distribuzione di piu' run. Nessuno dei due e' urgente in produzione e nessuno va fatto a caldo.
-4. La **Fase 7 (dashboard)** e' il prossimo lavoro. La dashboard tabellare (7a) non dipende dallo score, e mostrare prima la tabella dei segnali grezzi rende visibile se lo score aggiunge o toglie valore. Quando si costruisce: la colonna **frazione di posizione** e l'**eta' del deposito 13F** sono testo gia' pronto, e la **separazione delle due sezioni** si fa con la `LIKE` sull'etichetta `segnale da una sola fonte, nessuna conferma incrociata` senza ricalcolare nulla.
-5. **Qualita' dei dati a monte, da risolvere prima della Fase 7** (indagine del 2026-10-04, nessuna azione in questo commit: nessuno di questi punti altera i punteggi, e il flip resta comunque separato). La dashboard deve mostrare questi dati leggibili, quindi vanno affrontati come lavoro a se':
-   - **`P` non e' un artefatto: e' un titolo reale.** `companies.id=266`, `name='Everpure, Inc.'`, `cik='0001474432'`, con 33 barre di prezzo fino al 2026-10-02 (close 140.14): non e' delistato. Ticker e nome arrivano verbatim dal documento di proprieta' EDGAR (`issuerTradingSymbol`, `issuerName`) via `modules/insider_trading/module.py`, senza euristiche locali, e il CIK compare identico dentro l'URL del filing SEC. Storicamente quel CIK e' quello di Pandora Media: e' un **rinominamento**, non un errore di parsing. Il suo `-16.0` e' corretto e riproducibile a mano (quota venduta 49.4% pesata per valore x banda 1.3 x 1 insider = `-26`, piu' `price_move_up +10`): 8 Form 4 in settembre 2026 con **tutto il vertice** (CEO, CFO, Chief Accounting Officer, Chief Product Officer) e due uscite complete (`holdings_after = 0`).
-   - **La shortlist contiene punteggi negativi per costruzione**: e' "top N per score con almeno `min_signals` moduli", non "i titoli migliori". Con 13 ticker a 2+ moduli la coda arriva sotto zero. Se la dashboard deve mostrare solo candidati, il filtro va esplicitato li, invece che dedotto dal titolo "shortlist".
-   - **69 company con `name IS NULL`**: create dal solo `price_screener`, che chiama `upsert_company` passando solo il simbolo. Non hanno dati insider e non generano segnale, quindi non contaminano lo scoring, ma sono spazzatura in `companies` che in dashboard si mostrerebbero come righe senza nome. Le 21 ticker brevi che hanno invece dati insider sono tutte reali e con nome e CIK corretti (`SE`=Sea Ltd, `GD`=General Dynamics, `VZ`=Verizon, `MS`=Morgan Stanley, `CX`=CEMEX).
-   - **Il case del ticker non e' normalizzato**: `cv` (CapsoVision, Inc.) e' minuscolo mentre tutto il resto e' maiuscolo. Oggi non esiste un `CV` che lo duplichi, ma se arrivassero entrambi avremmo due company per lo stesso emittente. Il rischio e' reale solo se un futuro modulo passa il ticker grezzo dalla fonte senza `.upper()`.
+4. **Fase 7a implementata (commit 1 fatto)**. Il generatore e' `dashboard/generate.py`, il subcomando `python -m core.cli dashboard [--date] [--out]`. La pagina legge le righe di sintesi con due query e **separi le due sezioni con la regola della Fase 6, senza ricalcolare nulla**; i compositi fuori shortlist sono visibili in un `<details>` col motivo. Verifiche sui dati reali (2026-10-05): 16 in Sezione 1, 6 in Sezione 2, 163 fuori, 208 contributi grezzi; `BLLN -12.0` in shortlist con segno e colore; 18 righe `name → —` con title esplicativo; DB invariato (hash uguale prima/dopo la generazione).
+5. **I quattro punti di qualita' dei dati del 2026-10-04 sono stati risolti IN RENDERING nella Fase 7a, senza toccare i dati**: `P` (Everpure, ticker reale da rinominamento) resta com'e' e si legge nella pagina; la shortlist contiene punteggi negativi per costruzione ed e' esplicitato nel titolo della tabella ("top per score", non "i migliori"); le company con `name IS NULL` escono come `—` con il motivo nel title; il case del ticker (`cv`) non e' normalizzato ma il problema resta futuro e fuori dalla dashboard. Nessuna correzione dati e' stata fatta ne' prevista: erano un rischio per la Fase 7, non per lo scoring.
 
 ## Limiti noti di Fase 5 (per le fasi successive)
 - Tasso di risoluzione CUSIP **31%** (misurato su 329 CUSIP di 8 filing reali, dopo il gate sull'evidenza: era 34% e comprende 9 match errati eliminati). Smistamento completo in "Perche' il 31% dei CUSIP non risolve": il 70% del residuo sono fondi/ETF **assenti dalla fonte EDGAR** (limite di fonte, non di algoritmo). Con i 3 gestori concentrati scelti la misura e' favorevole: molte posizioni sono società a nome singolo (`NVIDIA CORPORATION`, `APPLIED MATLS INC`) che risolvono bene, mentre le posizioni non risolte sono soprattutto ETF/fondi, marginali per il nostro uso. **Non** sono marginali le azioni con classi multiple (es. Alphabet GOOG/GOOGL), lasciate apposta non risolte per non attribuire la classe sbagliata.
@@ -342,3 +339,58 @@ Nota per Fase 7 (da non dimenticare): dividere in 7a (dashboard tabellare pura) 
 - **Le righe di un ticker non sono scritte in modo atomico** (preesistente, non introdotto dalla correzione del 2026-10-04; fix rinviato di proposito per non mescolarlo a un commit gia' ampio). In `modules/scoring/module.py` i contributi e la riga di sintesi di un ticker stanno nello stesso `try` ma senza `SAVEPOINT`: se la `_insert` della sintesi solleva dopo che i contributi sono gia' partiti, l'`except` passa al ticker successivo e quei contributi restano nella transazione aperta, arrivando al `commit` finale **senza la riga `composite`**, con `rows_written` che li conta come riusciti. L'esposizione e' stretta perche' `_merge_contributions` aggrega per `(module_key, signal_type)` e quindi il vincolo UNIQUE non puo' essere violato dalla causa piu' ovvia; restano i CHECK/NOT NULL e i vincoli futuri. Il fix (un `SAVEPOINT` per ticker piu' un test che forza un errore a meta' scrittura e verifica che non restino righe) e' un commit a se' stante.
 - **Saturazione sul pavimento della banda piu' bassa, spostato dalla correzione del 2026-10-04b**: le vendite sotto l'1% di quota cadono tutte a `-3.0` (12 ticker, la nuova banda trascurabile) e non piu' a `-14.0`. Rimane pero' un pavimento a `-14.0` per la fascia 1%-5% (28 ticker). Dentro ciascun gruppo il punteggio non distingue piu' nulla e l'ordine e' quello alfabetico del ticker. Non e' un errore (e' la conseguenza voluta di non premiare i tagli rumorosi), ma in dashboard quelle righe vanno lette come "tutti al minimo", non come una classifica.
 - **I segnali contrastanti possono sparire per il percorso `usd_fallback`**: la soglia e' 10 e una vendita con frazione nota non scende mai sotto `-14.0`, ma una vendita senza `holdings_after` puo' arrivare a `-7.0` e quindi non piu' dichiarare conflitto contro un positivo forte. Oggi non succede (i quattro ticker a `-7.0` hanno un solo modulo), ma se il fallback crescesse la soglia andrebbe ripensata insieme alle bande, non separatamente.
+## Fase 7 (dashboard statica)
+
+### 7a — tabellare (fatta, commit 1)
+
+Generatore `dashboard/generate.py` + subcomando `python -m core.cli dashboard
+[--date] [--out]`. Pagina HTML autosufficiente (CSS inline, no JS), lettura
+sempre in `mode=ro` (mai `db.init_schema`), zero dipendenze runtime oltre la
+stdlib. Layout: header con data segnale e massimo di ogni tabella sorgente,
+Sezione 1 (convergenza multipla), Sezione 2 (convinzione fonte singola, badge
+"sconfermata"), `<details>` "fuori shortlist" con il motivo per riga, tabella
+completa dei contributi grezzi. Il separatore di sezione e' la stessa regola di
+`_shortlist_sections` della Fase 6 (punteggio, copertura, ticker): la pagina
+mostra esattamente le righe che il modulo ha classificato.
+
+Sui dati reali 2026-10-05: 16 in Sezione 1 (l'ultima e' `BLLN -12.0`, con badge
+di conflitto), 6 in Sezione 2, 163 fuori shortlist, 208 contributi grezzi.
+`--date 2026-10-02`: 13 + 6 + 155 + 195. DB invariato dopo la generazione
+(hash SHA256 uguale prima/dopo).
+
+### Le tre osservazioni di qualita' dati del 2026-10-04 e la loro sorte
+
+Risolve in rendering, nessuna correzione dati (come deciso in sessione):
+
+1. **`P` (Everpure) e' un titolo reale.** Il suo `-16.0` resta in Sezione 1 con
+   la descrizione: la pagina non deve nascondere le righe, deve renderle
+   leggibili.
+2. **La shortlist contiene punteggi negativi per costruzione** (top per score,
+   non "i migliori"). Reso esplicito: nel titolo della tabella e dalla colonna
+   punteggio con segno e colore, che mostra `-12.0` invece di suggerire che sia
+   un errore.
+3. **`name IS NULL`** (18 company con segnali nella data vista): cella `—` con
+   title "nome non disponibile nel database per <ticker>". Mai `>None<` nel
+   testo (c'e' un test).
+4. **Case del ticker non normalizzato** (`cv`): nessuna azione. Rischio solo se
+   un futuro modulo passa il ticker grezzo; non e' un problema della dashboard.
+
+### Test (12 nuovi, 232/232 totali)
+
+Separa secondo la regola della Fase 6 e coincide con `_shortlist_sections`;
+`parse_composite` estrae copertura/contributi/contrasto; escape di `<script>`
+e quote nel `title`; `>None<` mai presente e `—` presente; punteggio negativo
+con classe `neg`; Nessuna cella con la description non interpretabile va in
+rest col motivo; `NoSignals` per date senza righe e nessun file scritto; la
+generazione non modifica il DB; build deterministica a parita' di DB.
+
+### 7b — deploy (resta, commit 2)
+
+Pubblicazione di `data/dashboard.html` su GitHub Pages. Preparazione decisa:
+il job sta dentro `.github/workflows/pipeline.yml` (`needs: run`, subito prima
+di `git add data/`) perche' il `GITHUB_TOKEN` non alimenta nessun workflow, con
+gate `if: vars.PAGES_ENABLED == 'true'` per non incendiare i commit
+dell'auto-commit dati. Istruzioni utente per il commit 2: Settings → Pages →
+Source **GitHub Actions**; Settings → Actions → Variables → `PAGES_ENABLED=true`.
+Commit 1 e commit 2 separati per convenzione, con revisione dell'HTML da parte
+dell'utente nel mezzo.

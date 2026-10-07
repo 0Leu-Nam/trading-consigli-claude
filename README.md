@@ -30,7 +30,7 @@ py -m pytest
 ```
 
 ## Roadmap (dettaglio in PROGRESS.md)
-0. Scaffolding ✔(in corso) 1. Insider SEC EDGAR → 2. Cron GitHub Actions → 3. Prezzi/volumi → 4. News/sentiment → 5. 13F → 6. Scoring → 7. Dashboard → 8. Notifiche + hardening
+0. Scaffolding ✔(in corso) 1. Insider SEC EDGAR ✔ → 2. Cron GitHub Actions ✔ → 3. Prezzi/volumi ✔ → 4. News/sentiment ✔ → 5. 13F ✔ → 6. Scoring ✔ → 7. Dashboard ✔(in corso) → 8. Notifiche + hardening
 
 ## Come trovare il CIK di un gestore (per `filer_cik_filter`)
 
@@ -410,3 +410,39 @@ arrivare a `-7.0`.
 
 I ticker con `status = 'ignore'` non ricevono punteggio e non compaiono in
 shortlist, anche con score alto. Il conteggio finisce in `note`.
+
+## Dashboard statica (Fase 7a)
+
+La dashboard è una **pagina HTML autosufficiente** (CSS inline, nessun JS,
+nessuna dipendenza esterna) generata dal comando:
+
+```
+python -m core.cli dashboard [--date YYYY-MM-DD] [--out data/dashboard.html]
+```
+
+- **Sola lettura**: si collega al DB con `mode=ro` e non chiama
+  `db.init_schema`. Lo stesso commit che aggiorna `data/app.db` rigenera la
+  pagina e la salva in `data/dashboard.html`, versionata nel repo.
+- **Stesso dato della Fase 6**: legge le righe di sintesi (`scoring/composite`)
+  e i contributi scrivendo **due query**, senza ricalcolare coperture né voti
+  (nessun parsing di JSON: la `description` ha già la copertura, l'elenco
+  fonti, il contrasto e l'etichetta di sezione).
+- **Due sezioni separate, non un ranking unico**: l'output ripete la regola di
+  `_shortlist_sections` (punteggio decrescente, poi copertura, poi ticker) e
+  quindi mostra *esattamente* le righe che il modulo ha messo in shortlist. I
+  compositi della data che non entrano (fuori tetto, sotto soglia fonte
+  singola, descrizione non interpretabile) finiscono in un `<details>` **con
+  il motivo**, così la pagina non promette una completezza che non ha.
+- **I casi sporchi si gestiscono in rendering, non correggendo i dati**:
+  `name IS NULL` (18 company con segnali) esce come `—` con un title che lo
+  dice; i punteggi negativi (BLLN `-12.0`) restano in shortlist con segno e
+  colore.
+- **Tracciabilità**: la cella `copertura` ha nel `title` la `description`
+  intera della riga di sintesi; i contributi grezzi sono tutti visibili nella
+  tabella in fondo alla pagina.
+- **Freschezza dichiarata**: l'header mostra il massimo di ogni tabella
+  sorgente (prezzi, insider, 13F, notizie), letto dal DB e non dall'orologio.
+
+La **deploy su GitHub Pages** non è ancora attivo: arriva con il passo della
+pipeline (Fase 7b) che pubblica `data/dashboard.html` da `Actions`. L'ultima
+pagina generata è comunque commitata e navigabile clonando il repo.

@@ -4,6 +4,7 @@ Uso:
     python -m core.cli run-all
     python -m core.cli run <module_key>
     python -m core.cli status
+    python -m core.cli dashboard [--date YYYY-MM-DD] [--out data/dashboard.html]
 """
 
 import argparse
@@ -53,6 +54,22 @@ def cmd_run(args) -> int:
     return 0 if result.status != "error" else 1
 
 
+def cmd_dashboard(args) -> int:
+    from dashboard.generate import NoSignals, generate
+
+    load_env()
+    conf = load_config()
+    db_path = conf["database"]["path"]
+    out_path = args.out or "data/dashboard.html"
+    try:
+        page = generate(db_path, conf, out_path, signal_date=args.date)
+    except NoSignals as exc:
+        print(f"dashboard: {exc}", file=sys.stderr)
+        return 2
+    print(f"dashboard: {page} generata")
+    return 0
+
+
 def cmd_status(_args) -> int:
     from core.orchestrator import available_modules
 
@@ -82,9 +99,14 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run", help="Esegue un singolo modulo abilitato")
     p_run.add_argument("module_key")
     sub.add_parser("status", help="Mostra stato di DB, moduli e run log")
+    p_dash = sub.add_parser("dashboard", help="Genera la dashboard statica (Fase 7a)")
+    p_dash.add_argument("--date", help="Data segnale (YYYY-MM-DD); default: l'ultima disponibile")
+    p_dash.add_argument("--out", default="data/dashboard.html",
+                        help="Percorso del file HTML da scrivere")
     args = parser.parse_args(argv)
 
-    handlers = {"run-all": cmd_run_all, "run": cmd_run, "status": cmd_status}
+    handlers = {"run-all": cmd_run_all, "run": cmd_run, "status": cmd_status,
+                "dashboard": cmd_dashboard}
     handler = handlers.get(args.command)
     if handler is None:
         parser.print_help()
